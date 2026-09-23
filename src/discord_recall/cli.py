@@ -23,15 +23,51 @@ def listen():
 def backfill(
     channel_id: int = typer.Option(None, "--channel", "-c", help="Backfill a single channel by ID."),
     server_id: int = typer.Option(None, "--server", "-s", help="Backfill all channels in a server by ID."),
+    since: str = typer.Option(
+        None, "--since", help="Only capture messages on/after this date (YYYY-MM-DD)."
+    ),
+    until: str = typer.Option(
+        None, "--until", help="Only capture messages on/before this date (YYYY-MM-DD)."
+    ),
+    max_messages: int = typer.Option(
+        None, "--max-messages", help="Stop after N messages (per channel for --server)."
+    ),
+    batch_size: int = typer.Option(
+        None, "--batch-size", help="Messages per Discord request (default: config)."
+    ),
+    delay: float = typer.Option(
+        None, "--delay", help="Seconds to wait between requests (default: config)."
+    ),
 ):
-    """Backfill message history for a channel or entire server."""
+    """Backfill message history for a channel or entire server.
+
+    Add --since/--until/--max-messages for a bounded catch-up instead of
+    walking the whole history:
+
+      discord-recall backfill -c 111 --since 2026-09-17 --max-messages 1500
+      discord-recall backfill -s 999 --until 2026-09-20 --batch-size 50 --delay 1.5
+    """
     if not channel_id and not server_id:
         typer.echo("Provide --channel <id> or --server <id>")
         raise typer.Exit(1)
 
-    from discord_recall.capture.backfill import run_backfill
+    from discord_recall.capture.backfill import run_backfill, window_bounds
 
-    run_backfill(channel_id=channel_id, server_id=server_id)
+    try:
+        since_dt, until_dt = window_bounds(since, until)
+    except ValueError:
+        typer.echo("Dates must be YYYY-MM-DD", err=True)
+        raise typer.Exit(1)
+
+    run_backfill(
+        channel_id=channel_id,
+        server_id=server_id,
+        since=since_dt,
+        until=until_dt,
+        max_messages=max_messages,
+        batch_size=batch_size,
+        delay=delay,
+    )
 
 
 @app.command()

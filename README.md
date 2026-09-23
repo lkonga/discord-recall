@@ -233,6 +233,10 @@ uv run discord-recall listen
 # Backfill a single channel's full history
 uv run discord-recall backfill --channel <channel_id>
 
+# ...or bound it to a window instead of walking everything
+uv run discord-recall backfill --channel <channel_id> --since 2026-09-14 --max-messages 400
+uv run discord-recall backfill --server <server_id> --until 2026-09-20 --batch-size 50 --delay 1.5
+
 # Backfill every readable channel + thread in a server
 uv run discord-recall backfill --server <server_id>
 

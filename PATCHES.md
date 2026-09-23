@@ -110,8 +110,48 @@ uv sync --extra dev
 uv run python -m pytest tests/ -q
 ```
 
+## 5. Bounded backfill (`--since/--until/--max-messages`)
+
+The stock `backfill` walks a channel's entire history, which is unusable on an
+active channel (Cursor `#general` runs ~220 msgs/day, so a full walk is 100k+
+messages and thousands of requests). The capture side now takes a window:
+
+```bash
+# last few days only, hard cap, gentle cadence
+uv run discord-recall backfill -c <channel_id> --since 2026-09-14 \
+    --max-messages 400 --batch-size 100 --delay 1.2
+
+# everything up to a date
+uv run discord-recall backfill -c <channel_id> --until 2026-09-20
+
+# whole server, per-channel cap
+uv run discord-recall backfill -s <server_id> --since 2026-09-01 --max-messages 500
+```
+
+Semantics:
+
+* `--since` and `--until` are both inclusive (`window_bounds` turns `--until`
+  into an exclusive `before` bound at the next midnight UTC).
+* `--max-messages` is a hard cap per channel (per channel for `--server` runs).
+* `--batch-size` / `--delay` override the config defaults for one run.
+* Windowed runs are **stateless**: they neither read nor write
+  `channel_backfill_state`, so a bounded catch-up can never mark a channel
+  "complete" or make the next unbounded run skip what it still owes.
+  Unbounded runs keep resume/complete behaviour exactly as before.
+
+`tests/test_backfill_window.py` covers the window math, the cap, and the
+"state untouched" guarantee with stubs (no Discord, no DB).
+
 ## Verified
 
+* Live capture against the real Discord API with a self-bot token: 328 messages
+  from XMG & Friends `#general` (`--since 2026-09-14 --max-messages 400`, 21
+  authors) and 1200 from Cursor `#general` (`--since 2026-09-16
+  --max-messages 1200`, 92 authors), 4 requests / ~7s and 12 requests / ~30s,
+  bounded runs leaving `channel_backfill_state` untouched.
+* Real DeepSeek digests over that captured data, e.g. Cursor `#general`
+  2026-09-17 with 716 messages chunked into 2 passes + synthesis, and a
+  grounded `ask` answer citing captured messages with dates.
 * Real DeepSeek summaries produced end-to-end (`deepseek/deepseek-v4-flash` via
   an OpenAI-compatible gateway): single-day `digest`, 2 channels x 3 days
   `digest-range` (5 built, 1 reused), weekly + monthly periods, server-wide
@@ -125,5 +165,5 @@ uv run python -m pytest tests/ -q
   channel selection, `--last` together with `--from`.
 * `uv run python -m pytest tests/ -q` -> 17 passed.
 
-Not verified (needs a real Discord user token): `listen` and `backfill` against
-the live Discord API. Everything downstream of the local store is verified.
+Not verified: `listen` (real-time capture) was not exercised, only `backfill`.
+The token used is a self-bot user token, so Discord ToS risk applies.
