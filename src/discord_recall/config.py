@@ -1,4 +1,3 @@
-import os
 import stat
 from functools import lru_cache
 from pathlib import Path
@@ -20,6 +19,12 @@ class Settings(BaseSettings):
 
     discord_token: str = ""
     database_url: str = "sqlite+aiosqlite:///discord_recall.db"
+    # Generic OpenAI-compatible LLM endpoint. Set llm_base_url to target any
+    # compatible gateway (DeepSeek, OmniRoute, 9router, vLLM, llama.cpp, ...).
+    # When empty, the OpenRouter settings below are used unchanged.
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    llm_model: str = ""
     openrouter_api_key: str = ""
     openrouter_model: str = "google/gemini-3.1-flash-lite"
     telegram_bot_token: str = ""

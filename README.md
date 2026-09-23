@@ -245,16 +245,33 @@ uv run discord-recall digest --channel <channel_id> --date 2026-06-01 --send
 # Backfill historical digests for a channel (monthly >1yr, weekly last year)
 uv run discord-recall digest-backfill --channel <channel_id>
 
+# Digest several channels across a whole date range (daily | weekly | monthly)
+uv run discord-recall digest-range -c <id_a> -c <id_b> --from 2026-09-01 --to 2026-09-14
+uv run discord-recall digest-range --server <server_id> --period weekly --from 2026-06-01
+uv run discord-recall digest-range -c <id> --last 7 --send
+
+# Same thing from cron, with env-driven defaults
+RECALL_CHANNELS=<id_a>,<id_b> ./scripts/digest-range.sh --last 1 --send
+
 # Ask a natural-language question about your captured data
 uv run discord-recall ask "what did the community decide about X?" --server <server_id>
 uv run discord-recall ask "summarize alice's takes on rust" --user alice
 ```
+
+`digest-range` is idempotent per `(channel, period, period_start)`, supports
+`--dry-run` (lists channels, period labels and message counts, no LLM calls)
+and `--force` (rebuild a cell), and isolates failures per cell so one bad day
+does not abort the run. See [PATCHES.md](PATCHES.md) for details, including how
+to point the summarizer at DeepSeek or any OpenAI-compatible endpoint via
+`LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`, and
+`scripts/seed_demo_data.py` for a no-Discord-token test dataset.
 
 Run any command with `--help` for its full options:
 
 ```bash
 uv run discord-recall --help
 uv run discord-recall digest --help
+uv run discord-recall digest-range --help
 ```
 
 ---

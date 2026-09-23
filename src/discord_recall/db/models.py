@@ -10,7 +10,7 @@ class Base(DeclarativeBase):
     pass
 
 
-class BackfillStatus(enum.Enum):
+class BackfillStatus(str, enum.Enum):
     pending = "pending"
     in_progress = "in_progress"
     complete = "complete"
@@ -124,14 +124,14 @@ class Reaction(Base):
     message: Mapped["Message"] = relationship(back_populates="reactions")
 
 
-class DigestPeriod(enum.Enum):
+class DigestPeriod(str, enum.Enum):
     hourly = "hourly"
     daily = "daily"
     weekly = "weekly"
     monthly = "monthly"
 
 
-class WikiPageType(enum.Enum):
+class WikiPageType(str, enum.Enum):
     user_profile = "user_profile"
     topic = "topic"
     channel_overview = "channel_overview"
