@@ -9,6 +9,7 @@ Run:  uv run discord-recall-web        (or uv run uvicorn discord_recall.web.app
 
 from __future__ import annotations
 
+import asyncio
 import html
 import os
 import pathlib
@@ -22,7 +23,26 @@ from discord_recall.db import get_session_factory
 from discord_recall.db.models import Channel, Digest, Message, Server
 from sqlalchemy import desc, func, or_, select
 
-app = FastAPI(title="Discord Recall", docs_url=None, redoc_url=None)
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Run the paced job worker for the lifetime of the process."""
+    from discord_recall.web import jobs as job_queue
+
+    await job_queue.reap_interrupted()
+    task = asyncio.create_task(job_queue.worker_loop())
+    try:
+        yield
+    finally:
+        job_queue.stop()
+        task.cancel()
+
+
+app = FastAPI(
+    title="Discord Recall", docs_url=None, redoc_url=None, lifespan=lifespan
+)
 
 from discord_recall.web.api import router as api_router  # noqa: E402
 

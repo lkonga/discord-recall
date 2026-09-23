@@ -124,6 +124,37 @@ class Reaction(Base):
     message: Mapped["Message"] = relationship(back_populates="reactions")
 
 
+class JobStatus(str, enum.Enum):
+    queued = "queued"
+    running = "running"
+    done = "done"
+    error = "error"
+
+
+class Job(Base):
+    """A queued capture/digest/discover run, executed one at a time by the worker.
+
+    Jobs exist so long Discord work is never tied to one HTTP request: the UI
+    enqueues, polls progress, and a restart only loses the running job.
+    """
+
+    __tablename__ = "jobs"
+    __table_args__ = (Index("ix_jobs_status_created", "status", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    payload: Mapped[dict | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    phase: Mapped[str] = mapped_column(String(60), default="")
+    message: Mapped[str] = mapped_column(Text, default="")
+    messages: Mapped[int] = mapped_column(Integer, default=0)
+    channel_id: Mapped[int | None] = mapped_column(BigInteger)
+    server_id: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 class DigestPeriod(str, enum.Enum):
     hourly = "hourly"
     daily = "daily"

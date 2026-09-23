@@ -57,9 +57,74 @@ export interface Digest {
   content: string
 }
 
-export interface ActionStatus {
+/* ------------------------------------------------------------------ */
+/* Background jobs                                                     */
+/* ------------------------------------------------------------------ */
+
+/** Kinds the queue accepts. `other` keeps an unknown kind renderable. */
+export type JobKind = 'capture' | 'digest' | 'discover' | 'other'
+
+/** Terminal states are `done` and `error`; anything else is still active. */
+export type JobState = 'queued' | 'running' | 'done' | 'error'
+
+export interface JobStatus {
+  id: number
+  kind: JobKind
+  status: JobState
+  /** Worker-reported step, e.g. "starting", "capturing", "cooling down", "done". */
+  phase: string
+  /** Progress counter: messages captured, channels discovered, digests built. */
+  messages: number
+  /** 0-100 when the API can estimate it, null when the work has no known total. */
+  percent: number | null
+  /** Last line the worker reported; holds the run summary once the job is done. */
+  message: string
+  channelId: string | null
+  createdAt: string | null
+  updatedAt: string | null
+  finishedAt: string | null
+}
+
+/** Body of POST /api/jobs. Only the keys relevant to `kind` are sent. */
+export interface JobRequest {
+  kind: JobKind
+  channelId?: string
+  since?: string
+  until?: string
+  maxMessages?: number
+  /** Sent under the `from` key: Python keywords make the API use an alias. */
+  from?: string
+  to?: string
+  period?: Period
+  force?: boolean
+}
+
+/**
+ * Result of POST /api/jobs.
+ *
+ * `jobId` is null when the API accepted the request but refused to queue work
+ * (a digest range with no captured messages, for example); `status` then holds
+ * the reason and should be shown inline rather than as a generic failure.
+ */
+export interface JobQueueResult {
+  jobId: number | null
   ok: boolean
   status: string
+}
+
+export interface CaptureJobRequest {
+  channelId: string
+  since?: string
+  until?: string
+  maxMessages: number
+}
+
+export interface DigestJobRequest {
+  channelId: string
+  from: string
+  to?: string
+  period: Period
+  force?: boolean
 }
 
 export interface ServerListResponse {
@@ -72,22 +137,6 @@ export interface ChannelListResponse {
 
 export interface DigestListResponse {
   digests: Digest[]
-}
-
-export interface CaptureRequest {
-  channelId: string
-  since?: string
-  until?: string
-  maxMessages: number
-}
-
-export interface DigestRequest {
-  channelId: string
-  /** Sent to the API as the `from` key. */
-  from: string
-  to?: string
-  period: Period
-  force?: boolean
 }
 
 export interface AskResponse {
