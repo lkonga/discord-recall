@@ -30,9 +30,27 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     server_ids: list[int] = []
+    # Comma-separated guild ids. When set, the app refuses to touch anything
+    # outside this list: no discovery, no capture, no digests. Empty = allow all.
+    guild_whitelist: str = ""
     log_level: str = "INFO"
     backfill_batch_size: int = 100
     backfill_delay_seconds: float = 1.0
+
+
+def whitelisted_guilds(settings: Settings | None = None) -> set[int]:
+    """Parse GUILD_WHITELIST (CSV or JSON) into a set of guild ids."""
+    raw = (settings or get_settings()).guild_whitelist.strip()
+    if not raw:
+        return set()
+    if raw.startswith("["):
+        raw = raw.strip("[]")
+    out: set[int] = set()
+    for part in raw.replace('"', "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+    return out
 
 
 @lru_cache

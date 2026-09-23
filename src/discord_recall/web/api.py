@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import desc, func, select
 
+from discord_recall.config import whitelisted_guilds
 from discord_recall.db import get_session_factory
 from discord_recall.db.models import Channel, Digest, Job, Message, Server
 from discord_recall.web import jobs as job_queue
@@ -61,6 +62,25 @@ class JobBody(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+def whitelist_decision(channel_guild: int | None, whitelist: set[int]) -> tuple[bool, str]:
+    """Pure guard: may we act on a channel belonging to this guild?"""
+    if not whitelist:
+        return True, "no guild whitelist configured"
+    if channel_guild is None:
+        return False, "channel is not in any known guild"
+    if channel_guild in whitelist:
+        return True, "guild is whitelisted"
+    return False, f"guild {channel_guild} is outside GUILD_WHITELIST"
+
+
+async def _guard_channel(channel_id: int) -> tuple[bool, str]:
+    """Look up the channel's guild and apply the whitelist."""
+    factory = get_session_factory()
+    async with factory() as session:
+        ch = await session.get(Channel, channel_id)
+    return whitelist_decision(ch.server_id if ch else None, whitelisted_guilds())
+
+
 def _msg_count_subquery():
     return (
         select(func.count(Message.id))
@@ -80,8 +100,9 @@ def _last_msg_subquery():
 
 
 @router.get("/servers")
-async def servers():
+async def servers(all: bool = Query(False, description="Ignore the guild whitelist")):
     """Top level of the folded navigation: every server, with counts."""
+    wl = whitelisted_guilds()
     factory = get_session_factory()
     msg_count = _msg_count_subquery()
     async with factory() as session:
@@ -117,18 +138,20 @@ async def servers():
             ).all()
         )
 
-    return {
-        "servers": [
-            {
-                "id": str(sid),
-                "name": name,
-                "channels": channels,
-                "captured": int(captured.get(sid, 0)),
-                "digests": int(digest_counts.get(sid, 0)),
-            }
-            for sid, name, channels in rows
-        ]
-    }
+    items = [
+        {
+            "id": str(sid),
+            "name": name,
+            "channels": channels,
+            "captured": int(captured.get(sid, 0)),
+            "digests": int(digest_counts.get(sid, 0)),
+            "whitelisted": (not wl) or sid in wl,
+        }
+        for sid, name, channels in rows
+    ]
+    if wl and not all:
+        items = [i for i in items if i["whitelisted"]]
+    return {"servers": items, "whitelist": sorted(wl)}
 
 
 @router.get("/channels")
@@ -157,6 +180,10 @@ async def channels(
             .outerjoin(Digest, Digest.channel_id == Channel.id)
             .group_by(Channel.id, Channel.name, Server.id, Server.name)
         )
+        wl = whitelisted_guilds()
+        if wl:
+            # Outside the whitelist the app does not even list channels.
+            stmt = stmt.where(Server.id.in_(sorted(wl)))
         if server:
             stmt = stmt.where(Channel.server_id == int(server))
         if q:
@@ -274,6 +301,9 @@ async def create_job(body: JobBody):
         if not body.channelId or not body.channelId.isdigit():
             raise HTTPException(status_code=400, detail="channelId must be a Discord snowflake")
         channel_id = int(body.channelId)
+        allowed, reason = await _guard_channel(channel_id)
+        if not allowed:
+            return {"ok": False, "status": f"refused: {reason}", "whitelistBlocked": True}
         payload["channelId"] = body.channelId
     if kind == "capture":
         payload.update(
@@ -302,8 +332,32 @@ async def create_job(body: JobBody):
             }
         payload.update(**{"from": body.from_}, to=body.to or None, period=body.period, force=body.force)
 
+    if kind == "discover":
+        wl = whitelisted_guilds()
+        # Never walk the whole account when a whitelist is configured: one
+        # request per whitelisted guild instead of one per guild we are in.
+        payload["servers"] = [str(g) for g in sorted(wl)]
+
     job_id = await job_queue.enqueue(kind, payload, channel_id=channel_id)
     return {"ok": True, "jobId": job_id, "status": f"{kind} queued"}
+
+
+@router.get("/whitelist")
+async def whitelist():
+    """What the app is allowed to touch."""
+    wl = whitelisted_guilds()
+    factory = get_session_factory()
+    async with factory() as session:
+        rows = (
+            await session.execute(
+                select(Server.id, Server.name).order_by(Server.name)
+            )
+        ).all() if wl else []
+    return {
+        "guildWhitelist": sorted(wl),
+        "enforced": bool(wl),
+        "guilds": [{"id": str(sid), "name": name} for sid, name in rows if sid in wl],
+    }
 
 
 @router.get("/jobs/{job_id}")
@@ -422,7 +476,7 @@ async def _build_digest_inline(body: DigestBody):
 
 @router.post("/discover")
 async def discover():
-    """Compat shim: enqueues a channel-discovery job."""
+    """Compat shim: enqueues a channel-discovery job, scoped to the whitelist."""
     return await create_job(JobBody(kind="discover"))
 
 

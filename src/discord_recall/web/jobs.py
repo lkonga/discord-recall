@@ -186,7 +186,10 @@ def build_args(job: Job) -> list[str]:
         return args
 
     if job.kind == "discover":
-        return ["discover", "--delay", f"{_jittered(1.0):.2f}"]
+        args = ["discover", "--delay", f"{_jittered(1.0):.2f}"]
+        for gid in payload.get("servers") or []:
+            args += ["--server", str(gid)]
+        return args
 
     raise ValueError(f"unknown job kind {job.kind!r}")
 

@@ -19,8 +19,37 @@ MAX_MESSAGES = int(os.environ.get("MAX_MESSAGES", "600"))
 SEND = os.environ.get("SEND_TELEGRAM", "true").lower() == "true"
 
 
+def _whitelist() -> set[int]:
+    raw = os.environ.get("GUILD_WHITELIST", "").strip().strip("[]")
+    return {int(p) for p in (x.strip() for x in raw.split(",")) if p.isdigit()}
+
+
 def channels() -> list[str]:
-    return [c.strip() for c in os.environ.get("DIGEST_CHANNELS", "").split(",") if c.strip()]
+    wanted = [c.strip() for c in os.environ.get("DIGEST_CHANNELS", "").split(",") if c.strip()]
+    whitelist = _whitelist()
+    if not whitelist or not wanted:
+        return wanted
+    # Belt and braces: even if DIGEST_CHANNELS is wrong, never touch a guild that
+    # is not on the whitelist.
+    import sqlite3
+
+    db = os.environ.get("DATABASE_URL", "").rsplit("///", 1)[-1] or "/data/discord_recall.db"
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        allowed = {
+            str(cid) for (cid,) in con.execute(
+                "select id from channels where server_id in (%s)"
+                % ",".join(str(g) for g in whitelist)
+            )
+        }
+        con.close()
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        print(f"[scheduler] could not read the store ({exc}); skipping digests", flush=True)
+        return []
+    skipped = [c for c in wanted if c not in allowed]
+    if skipped:
+        print(f"[scheduler] skipping {len(skipped)} channel(s) outside GUILD_WHITELIST", flush=True)
+    return [c for c in wanted if c in allowed]
 
 
 def run(args: list[str]) -> None:
