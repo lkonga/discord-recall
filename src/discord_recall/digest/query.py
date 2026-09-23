@@ -1,9 +1,8 @@
 """Query engine — ask questions about channels, servers, and users."""
 
-from datetime import datetime, timedelta, timezone
 
 from loguru import logger
-from sqlalchemy import select, and_, func, or_
+from sqlalchemy import select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from discord_recall.db import get_session_factory
@@ -11,11 +10,9 @@ from discord_recall.db.models import (
     Author,
     Channel,
     Digest,
-    DigestPeriod,
     Message,
     Server,
     WikiPage,
-    WikiPageType,
 )
 
 QUERY_SYSTEM = """You are a Discord intelligence analyst with deep knowledge of the conversations in these servers. Answer the user's question based on the context provided.

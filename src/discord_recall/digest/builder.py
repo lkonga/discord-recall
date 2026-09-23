@@ -1,6 +1,5 @@
 """Digest builder — summarize activity across channels via LLM."""
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
 

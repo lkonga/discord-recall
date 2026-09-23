@@ -3,7 +3,6 @@
 from datetime import datetime, timezone
 
 import discord
-from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import AsyncSession
