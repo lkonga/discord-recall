@@ -48,6 +48,14 @@ def window_bounds(
     return since_dt, until_dt
 
 
+class ChannelForbidden(RuntimeError):
+    """The account cannot read this channel (403).
+
+    A 403 is a hard stop for that channel: retrying cannot help, and every retry
+    is another invalid request against the account's budget.
+    """
+
+
 async def _get_backfill_state(session, channel_id: int) -> ChannelBackfillState | None:
     result = await session.execute(
         select(ChannelBackfillState).where(ChannelBackfillState.channel_id == channel_id)
@@ -202,6 +210,18 @@ async def backfill_channel(
             + (" (bounded run, state untouched)" if bounded else "")
         )
 
+    except discord.Forbidden as exc:
+        if not bounded:
+            async with session_factory() as session:
+                await _set_backfill_status(
+                    session, track_id, BackfillStatus.failed, last_message_id=last_id
+                )
+        logger.error(
+            f"[{guild_name}/{channel_name}] dropped: this account cannot read it (403)"
+        )
+        raise ChannelForbidden(
+            f"#{channel_name} is not readable by this account (403) - dropped, not retried"
+        ) from exc
     except Exception:
         if not bounded:
             async with session_factory() as session:
@@ -301,8 +321,14 @@ class BackfillClient(discord.Client):
                     logger.error(f"Server {self._target_server_id} not found")
                 else:
                     await backfill_server(self, guild, **self._window)
+        except ChannelForbidden as exc:
+            # Exit with a distinct code so the job queue can mark the channel
+            # dropped instead of retrying it forever.
+            logger.error(f"backfill dropped a channel: {exc}")
+            self._exit_code = 3
         except Exception:
             logger.exception("Backfill failed")
+            self._exit_code = 1
         finally:
             await self.close()
 
@@ -330,3 +356,6 @@ def run_backfill(
         delay=delay,
     )
     client.run(settings.discord_token, log_handler=None)
+    code = getattr(client, "_exit_code", 0)
+    if code:
+        raise SystemExit(code)
