@@ -63,10 +63,14 @@ _MESSAGES_RE = re.compile(r"(\d+) messages so far")
 _COMPLETE_RE = re.compile(r"Backfill complete[^\d]{0,6}(\d+) messages")
 _DISCOVER_RE = re.compile(r"discovered (\d+) servers, (\d+) text channels")
 _DIGEST_RE = re.compile(r"(\d+) built, (\d+) reused")
-_LIMIT_RE = re.compile(r"rate limited|429", re.IGNORECASE)
+# Matches "429", "rate limited" and py-self's own wording "Global rate limit has
+# been hit." (the phrase has no "limited", so the older pattern missed it).
+_LIMIT_RE = re.compile(r"rate ?limit|429", re.IGNORECASE)
 # A rejected token must stop the queue: every further attempt is an invalid
 # request, and Discord bans on 10k invalid requests per 10 minutes.
 _AUTH_RE = re.compile(r"\b401\b|unauthori[sz]ed|improper token|invalid token", re.I)
+# py-self raises on exactly this string: "Global rate limit has been hit."
+_GLOBAL_RE = re.compile(r"global rate limit has been hit|global|cloudflare|ban", re.I)
 
 _stop = False
 _auth_failed = False
@@ -404,7 +408,9 @@ async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
     lines: list[str] = []
     cooldowns = 0
     rate_limited = False
-    requests_est = 0
+    # One "N messages so far" line is emitted per page fetch, so this is a real
+    # request count rather than an estimate derived from the message count.
+    requests = 0
     assert proc.stdout is not None
     async for raw in proc.stdout:
         line = raw.decode(errors="replace").rstrip()
@@ -414,24 +420,42 @@ async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
         messages = _MESSAGES_RE.search(line)
         if messages:
             fetched = int(messages.group(1))
-            # Requests, not messages, are the scarce unit: a page is PACE_BATCH
-            # messages, so bound the run by the researched request budget too.
-            requests_est = fetched // max(1, PACE_BATCH) + 1
-            if requests_est > PACE_MAX_REQUESTS:
+            requests += 1
+            # A page landing proves we are not in a hot loop, so consecutive-429
+            # bookkeeping restarts here.
+            cooldowns = 0
+
+            # The CLI clamps the requested cap, but the parent enforces it too:
+            # a changed default or a future caller must not be able to overrun it.
+            if fetched > PACE_MAX_MESSAGES:
                 proc.kill()
                 await _update(
                     job.id,
                     phase="aborted",
                     message=(
-                        f"stopped at {requests_est} requests "
-                        f"(budget {PACE_MAX_REQUESTS}/run); lower the cap or raise "
+                        f"stopped after {fetched} messages, above the "
+                        f"PACE_MAX_MESSAGES ceiling ({PACE_MAX_MESSAGES})"
+                    ),
+                )
+                logger.error(f"job {job.id}: message cap exceeded ({fetched})")
+                raise RequestBudgetExceeded(f"{fetched} messages > {PACE_MAX_MESSAGES}")
+
+            if requests > PACE_MAX_REQUESTS:
+                proc.kill()
+                await _update(
+                    job.id,
+                    phase="aborted",
+                    message=(
+                        f"stopped at {requests} requests (budget "
+                        f"{PACE_MAX_REQUESTS}/run); lower the cap or raise "
                         f"PACE_MAX_REQUESTS deliberately"
                     ),
                 )
                 logger.error(
-                    f"job {job.id}: request budget exceeded ({requests_est} > {PACE_MAX_REQUESTS})"
+                    f"job {job.id}: request budget exceeded ({requests} > {PACE_MAX_REQUESTS})"
                 )
-                raise RequestBudgetExceeded(f"{requests_est} requests > {PACE_MAX_REQUESTS}")
+                raise RequestBudgetExceeded(f"{requests} requests > {PACE_MAX_REQUESTS}")
+
             await _update(
                 job.id,
                 phase="capturing",
@@ -452,7 +476,7 @@ async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
         elif _LIMIT_RE.search(line):
             cooldowns += 1
             rate_limited = True
-            global_block = bool(re.search(r"global|cloudflare|ban", line, re.I))
+            global_block = bool(_GLOBAL_RE.search(line))
             retry_after = re.search(r"retry.?after[^0-9]{0,4}(\d+(?:\.\d+)?)", line, re.I)
 
             if cooldowns > MAX_429_STRIKES or global_block:
