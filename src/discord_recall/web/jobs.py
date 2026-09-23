@@ -574,6 +574,20 @@ async def _execute(job: Job) -> bool:
     else:
         total = 0
 
+    # Exit code 3 is the capture path's "this channel is not readable" (403):
+    # a dropped channel, not a retryable failure.
+    if rc == 3:
+        await _update(
+            job.id,
+            status=JobStatus.error.value,
+            phase="dropped",
+            message=summary[-300:] or "channel dropped: not readable by this account (403)",
+            messages=total,
+            finished_at=_now(),
+        )
+        logger.warning(f"job {job.id} dropped a channel: {summary[-120:]}")
+        return False
+
     await _update(
         job.id,
         status=(JobStatus.done.value if rc == 0 else JobStatus.error.value),
