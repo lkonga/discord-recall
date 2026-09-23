@@ -10,17 +10,47 @@ Run:  uv run discord-recall-web        (or uv run uvicorn discord_recall.web.app
 from __future__ import annotations
 
 import html
+import os
 import asyncio
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
+from urllib.parse import quote_plus
 
 from discord_recall.db import get_session_factory
 from discord_recall.db.models import Channel, Digest, Message, Server
 from sqlalchemy import desc, func, select
 
 app = FastAPI(title="Discord Recall", docs_url=None, redoc_url=None)
+
+
+async def run_cli(args: list[str], timeout: float = 1800) -> tuple[int, str]:
+    """Run the CLI in a fresh process so capture/digest work never blocks the UI."""
+    proc = await asyncio.create_subprocess_exec(
+        "discord-recall",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return 124, f"timed out after {int(timeout)}s"
+    text = out.decode(errors="replace")
+    return proc.returncode or 0, text
+
+
+def _last_line(text: str) -> str:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "(no output)"
+    line = lines[-1].strip()
+    # Strip the loguru prefix: "2026-09-23 22:34:00.314 | INFO | mod:fn:12 - message"
+    if " - " in line and "|" in line:
+        line = line.split(" - ", 1)[1].strip()
+    return line
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>{title}</title>
@@ -74,9 +104,21 @@ async def healthz():
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(msg: str = ""):
     factory = get_session_factory()
     async with factory() as session:
+        msg_count = (
+            select(func.count(Message.id))
+            .where(Message.channel_id == Channel.id)
+            .correlate(Channel)
+            .scalar_subquery()
+        )
+        last_msg = (
+            select(func.max(Message.created_at))
+            .where(Message.channel_id == Channel.id)
+            .correlate(Channel)
+            .scalar_subquery()
+        )
         rows = (
             await session.execute(
                 select(
@@ -85,44 +127,70 @@ async def index():
                     Server.name,
                     func.count(Digest.id),
                     func.max(Digest.period_start),
+                    msg_count,
+                    last_msg,
                 )
                 .join(Server, Channel.server_id == Server.id)
                 .outerjoin(Digest, Digest.channel_id == Channel.id)
                 .group_by(Channel.id, Channel.name, Server.name)
-                .order_by(desc(func.count(Digest.id)))
+                .order_by(desc(func.count(Digest.id)), desc(msg_count))
             )
         ).all()
-        totals = (
-            await session.execute(
-                select(func.count(Digest.id), func.count(Message.id)).select_from(Digest)
-            )
-        ).one()
+        digest_total = (
+            await session.execute(select(func.count(Digest.id)))
+        ).scalar_one()
         msg_total = (await session.execute(select(func.count(Message.id)))).scalar_one()
 
-    body = [f"<p class='muted'>{totals[0]} digests · {msg_total} captured messages</p>"]
-    body.append("<table><tr><th>Server</th><th>Channel</th><th>Digests</th><th>Latest</th><th></th></tr>")
-    for cid, name, server, count, latest in rows:
-        if not count:
-            continue
+    tracked = {
+        c.strip() for c in os.environ.get("DIGEST_CHANNELS", "").split(",") if c.strip()
+    }
+    body = [
+        f"<p class='muted'>{digest_total} digests · {msg_total} captured messages · "
+        f"scheduler captures: {', '.join(sorted(tracked)) or 'nothing yet'}</p>"
+    ]
+    body.append(
+        "<table><tr><th>Server</th><th>Channel</th><th>Tracked</th><th>Messages</th>"
+        "<th>Digests</th><th>Latest digest</th><th>Last message</th><th></th></tr>"
+    )
+    for cid, name, server, digests, latest, msgs, last_msg in rows:
         link = f"<a href='/channel/{cid}'>#{html.escape(name)}</a>"
         when = latest.strftime("%Y-%m-%d") if latest else "-"
+        last_seen = last_msg.strftime("%Y-%m-%d") if last_msg else "-"
+        is_tracked = "yes" if str(cid) in tracked else ""
+        default_day = when if when != "-" else last_seen
         gen = (
             f"<form method='post' action='/generate/{cid}'>"
-            f"<input type='date' name='day' value='{when}'><button>digest that day</button></form>"
+            f"<input type='date' name='day' value='{default_day}'>"
+            f"<button>digest that day</button></form>"
         )
         body.append(
-            f"<tr><td>{html.escape(server)}</td><td>{link}</td><td>{count}</td>"
-            f"<td>{when}</td><td>{gen}</td></tr>"
+            f"<tr><td>{html.escape(server)}</td><td>{link}</td><td>{is_tracked}</td>"
+            f"<td>{msgs}</td><td>{digests}</td><td>{when}</td><td>{last_seen}</td>"
+            f"<td>{gen}</td></tr>"
         )
     body.append("</table>")
+    body.append(
+        "<h3>Capture a channel</h3>"
+        "<form method='post' action='/capture-new'>"
+        "<input name='channel_id' placeholder='channel ID' size='22' required>"
+        "<label>since <input type='date' name='since'></label>"
+        "<label>max messages <input type='number' name='max_messages' value='600' "
+        "min='50' step='50'></label><button>capture</button></form>"
+    )
+    if msg:
+        body.append(f"<p class='muted'>{html.escape(msg)}</p>")
+    body.append(
+        "<p class='muted'>Every channel in the local store is listed, with or without "
+        "digests. To capture a new channel, add its ID to DIGEST_CHANNELS in the "
+        "Dokploy environment and the next cycle will start pulling it.</p>"
+    )
     body.append(
         "<h3>Ask</h3><form method='post' action='/ask'>"
         "<input name='question' size='52' placeholder='what happened with X this week?'>"
         "<select name='channel_id'><option value=''>all channels</option>"
         + "".join(
             f"<option value='{cid}'>#{html.escape(name)}</option>"
-            for cid, name, _, count, _ in rows
-            if count
+            for cid, name, _, _, _, _, _ in rows
         )
         + "</select><button>ask</button></form>"
     )
@@ -130,7 +198,7 @@ async def index():
 
 
 @app.get("/channel/{channel_id}", response_class=HTMLResponse)
-async def channel(channel_id: int, limit: int = 30):
+async def channel(channel_id: int, limit: int = 30, msg: str = ""):
     factory = get_session_factory()
     async with factory() as session:
         ch = await session.get(Channel, channel_id)
@@ -156,8 +224,29 @@ async def channel(channel_id: int, limit: int = 30):
 
     body = [
         f"<p class='muted'>{msg_total} captured messages · {len(digests)} digests</p>",
-        "<table><tr><th>Period</th><th>Start</th><th>Messages</th></tr>",
     ]
+    if msg:
+        body.append(f"<p class='muted'>{html.escape(msg)}</p>")
+    body.append(
+        "<h3>1. Capture messages</h3>"
+        f"<form method='post' action='/capture/{channel_id}'>"
+        "<label>since <input type='date' name='since'></label>"
+        "<label>until <input type='date' name='until'></label>"
+        "<label>max <input type='number' name='max_messages' value='600' min='50' "
+        "step='50'></label><button>capture</button></form>"
+    )
+    body.append(
+        "<h3>2. Build digest</h3>"
+        f"<form method='post' action='/digest/{channel_id}'>"
+        "<input type='date' name='date_from' required>"
+        "<input type='date' name='date_to'>"
+        "<select name='period'><option>daily</option><option>weekly</option>"
+        "<option>monthly</option></select>"
+        "<label><input type='checkbox' name='force' value='true'> rebuild</label>"
+        "<button>build</button></form>"
+    )
+    body.append("<h3>Digests</h3>")
+    body.append("<table><tr><th>Period</th><th>Start</th><th>Messages</th></tr>")
     for d in digests:
         body.append(
             f"<tr><td>{d.period}</td>"
@@ -182,6 +271,66 @@ async def generate(channel_id: int, day: str = Form(...)):
         return render("Bad date", "<p>Date must be YYYY-MM-DD.</p>")
     await build_daily_digest(channel_id, when)
     return RedirectResponse(f"/channel/{channel_id}", status_code=303)
+
+
+async def _capture(channel_id: int, since: str, until: str, max_messages: int) -> str:
+    args = ["backfill", "-c", str(channel_id), "--max-messages", str(max_messages)]
+    if since:
+        args += ["--since", since]
+    if until:
+        args += ["--until", until]
+    rc, out = await run_cli(args)
+    return f"capture rc={rc}: {_last_line(out)}"
+
+
+@app.post("/capture/{channel_id}")
+async def capture(
+    channel_id: int,
+    since: str = Form(""),
+    until: str = Form(""),
+    max_messages: int = Form(600),
+):
+    """Pull a bounded window of history for a channel (pick channel -> capture)."""
+    status = await _capture(channel_id, since, until, max_messages)
+    return RedirectResponse(
+        f"/channel/{channel_id}?msg={quote_plus(status)}", status_code=303
+    )
+
+
+@app.post("/capture-new")
+async def capture_new(
+    channel_id: str = Form(...),
+    since: str = Form(""),
+    max_messages: int = Form(600),
+):
+    """Capture a channel by ID that is not in the store yet."""
+    raw = channel_id.strip().split("/")[-1].split("?")[0]
+    if not raw.isdigit():
+        return render("Bad channel", "<p>Channel ID must be numeric.</p>")
+    cid = int(raw)
+    status = await _capture(cid, since, "", max_messages)
+    return RedirectResponse(f"/channel/{cid}?msg={quote_plus(status)}", status_code=303)
+
+
+@app.post("/digest/{channel_id}")
+async def digest_range_ui(
+    channel_id: int,
+    date_from: str = Form(...),
+    date_to: str = Form(""),
+    period: str = Form("daily"),
+    force: bool = Form(False),
+):
+    """Build digests for a channel across a date range."""
+    args = ["digest-range", "-c", str(channel_id), "--from", date_from, "--period", period]
+    if date_to:
+        args += ["--to", date_to]
+    if force:
+        args += ["--force"]
+    rc, out = await run_cli(args)
+    return RedirectResponse(
+        f"/channel/{channel_id}?msg={quote_plus(f'digest rc={rc}: {_last_line(out)}')}",
+        status_code=303,
+    )
 
 
 @app.post("/ask", response_class=HTMLResponse)
