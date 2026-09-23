@@ -27,17 +27,21 @@ from sqlalchemy import select, update
 from discord_recall.db import get_session_factory
 from discord_recall.db.models import Job, JobStatus
 
-PACE_BATCH = int(os.environ.get("PACE_BATCH", "100"))
-PACE_DELAY = float(os.environ.get("PACE_DELAY", "2.5"))
-# Jitter only ever ADDS to the base delay: a fixed pace is the pattern that gets
-# flagged, but going below the researched floor is worse.
-PACE_JITTER_EXTRA = float(os.environ.get("PACE_JITTER_EXTRA", "1.5"))
-PACE_MAX_MESSAGES = int(os.environ.get("PACE_MAX_MESSAGES", "1000"))
-PACE_MAX_REQUESTS = int(os.environ.get("PACE_MAX_REQUESTS", "30"))
-COOLDOWN_429 = float(os.environ.get("PACE_429_COOLDOWN", "60"))
-GLOBAL_COOLDOWN = float(os.environ.get("PACE_GLOBAL_COOLDOWN", "900"))
-MAX_429_STRIKES = int(os.environ.get("PACE_MAX_429_STRIKES", "3"))
-POST_429_PAUSE = float(os.environ.get("PACE_POST_429_PAUSE", "600"))
+# Evidence status per knob (see PATCHES.md section 7 for the quotes):
+#   QUOTED  = a specific upstream value we match
+#   MARGIN  = no upstream number exists; conservative engineering choice, with
+#             the reasoning stated, and deliberately not claimed as "policy"
+PACE_BATCH = int(os.environ.get("PACE_BATCH", "100"))  # QUOTED: DCE + py-self page at 100
+PACE_DELAY = float(os.environ.get("PACE_DELAY", "2.5"))  # QUOTED-ish: Undiscord hand-tested floor ~2.1s
+# Jitter only ever ADDS to the base delay: a fixed interval is the pattern called
+# out in Undiscord #168, but going below the floor is worse. Range is MARGIN.
+PACE_JITTER_EXTRA = float(os.environ.get("PACE_JITTER_EXTRA", "1.5"))  # MARGIN
+PACE_MAX_MESSAGES = int(os.environ.get("PACE_MAX_MESSAGES", "1000"))  # MARGIN
+PACE_MAX_REQUESTS = int(os.environ.get("PACE_MAX_REQUESTS", "30"))  # MARGIN
+COOLDOWN_429 = float(os.environ.get("PACE_429_COOLDOWN", "60"))  # MARGIN (DCE only quotes the +1s buffer)
+GLOBAL_COOLDOWN = float(os.environ.get("PACE_GLOBAL_COOLDOWN", "900"))  # MARGIN
+MAX_429_STRIKES = int(os.environ.get("PACE_MAX_429_STRIKES", "3"))  # MARGIN (py-self's ceiling is 5 attempts)
+POST_429_PAUSE = float(os.environ.get("PACE_POST_429_PAUSE", "600"))  # MARGIN
 POLL_SECONDS = float(os.environ.get("JOB_POLL_SECONDS", "2"))
 
 _MESSAGES_RE = re.compile(r"(\d+) messages so far")
@@ -278,10 +282,24 @@ async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
                 await asyncio.sleep(GLOBAL_COOLDOWN)
                 raise RateLimitAbort(reason)
 
+            if not retry_after:
+                # Upstream rule (discord-userdoccers rate-limits.mdx): with no
+                # Retry-After header you must not retry programmatically.
+                proc.kill()
+                await _update(
+                    job.id,
+                    phase="aborted",
+                    message=(
+                        "stopped: 429 without a Retry-After header - not retried "
+                        "by policy; check the token before running again"
+                    ),
+                )
+                logger.error(f"job {job.id}: 429 with no Retry-After - aborting")
+                raise RateLimitAbort("429 without Retry-After")
+
             # exponential spaced waits, never shorter than retry_after + 1s buffer
             wait = COOLDOWN_429 * (2 ** (cooldowns - 1))
-            if retry_after:
-                wait = max(wait, min(float(retry_after.group(1)), 900) + 1.0)
+            wait = max(wait, min(float(retry_after.group(1)), 900) + 1.0)
             wait = min(wait, 900)
             await _update(
                 job.id,
