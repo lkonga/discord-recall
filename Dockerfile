@@ -1,10 +1,10 @@
 # --- frontend (React + Vite + shadcn/ui) ---
 FROM node:22-alpine AS web
-WORKDIR /web
+WORKDIR /app/web
 # The frontend is optional at build time: if web/package.json is absent the
 # stage emits an empty dist and the image serves the server-rendered fallback.
-COPY web ./web
-RUN cd web && if [ -f package.json ]; then \
+COPY web ./
+RUN if [ -f package.json ]; then \
       npm install --no-audit --no-fund && npm run build; \
     else \
       mkdir -p dist && echo "no frontend sources present"; \
@@ -33,7 +33,7 @@ RUN pip install --no-cache-dir ".[web]"
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY docker ./docker
-COPY --from=web /web/dist /app/web/dist
+COPY --from=web /app/web/dist /app/web/dist
 RUN chmod +x /app/docker/entrypoint.sh
 
 VOLUME ["/data"]
