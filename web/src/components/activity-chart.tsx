@@ -15,14 +15,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from 'cn'
 import type { ChannelActivity } from '@/lib/api'
 import { enumerateDays, formatCount, formatDay, toIsoDay } from '@/lib/format'
-
-const WINDOWS = [
-  { value: '30', label: 'Last 30 days' },
-  { value: '90', label: 'Last 90 days' },
-  { value: '180', label: 'Last 180 days' },
-  { value: '365', label: 'Last 365 days' },
-  { value: '1825', label: 'Last 5 years' },
-]
+import { ACTIVITY_WINDOWS } from '@/lib/job-scope'
 
 interface ActivityChartProps {
   activity: ChannelActivity | null
@@ -120,8 +113,8 @@ export function ActivityChart({
               <SelectValue />
             </SelectTrigger>
             <SelectContent align="end">
-              {WINDOWS.map((option) => (
-                <SelectItem key={option.value} value={option.value}>
+              {ACTIVITY_WINDOWS.map((option) => (
+                <SelectItem key={option.value} value={String(option.value)}>
                   {option.label}
                 </SelectItem>
               ))}

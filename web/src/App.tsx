@@ -4,7 +4,9 @@ import { toast, Toaster } from 'sonner'
 
 import { ActivityChart } from '@/components/activity-chart'
 import { ChannelCombobox } from '@/components/channel-combobox'
-import { RunPanel, type RangeSelection } from '@/components/run-panel'
+import { JobProgressCard } from '@/components/job-progress'
+import { JobsPanel } from '@/components/jobs-panel'
+import { RunPanel, type LastRun, type RangeSelection } from '@/components/run-panel'
 import { ServersSidebar } from '@/components/servers-sidebar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -13,18 +15,24 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useAsync } from '@/hooks/use-async'
 import { useDebouncedValue } from '@/hooks/use-debounced-value'
+import { useJobWatcher, useRecentJobs } from '@/hooks/use-jobs'
 import {
-  captureMessages,
-  discoverChannels,
   fetchChannelActivity,
   fetchChannelDigests,
-  generateDigest,
+  isJobActive,
   listChannels,
   listServers,
+  queueCapture,
+  queueDigest,
+  queueDiscover,
   type ChannelSummary,
+  type JobKind,
+  type JobStatus,
   type Period,
 } from '@/lib/api'
 import { formatCompact, formatDateTime, relativeFromNow, toIsoDay } from '@/lib/format'
+import { scopeRangeLabel, summariseScope, windowPresetFor, type Scope } from '@/lib/job-scope'
+import { jobHeadline } from '@/lib/job-text'
 
 // The markdown renderer is only needed once a channel is open, so it is split
 // out of the initial bundle (react-markdown + remark-gfm are both chunky).
@@ -37,6 +45,17 @@ const DigestBrowser = lazy(() =>
 
 const DEFAULT_ACTIVITY_WINDOW = 90
 
+/** The run this tab is following, with everything needed to describe it. */
+interface WatchedRun {
+  jobId: number
+  kind: JobKind
+  channelId: string | null
+  channelName: string | null
+  /** Scope captured when the run was queued; null for jobs adopted from the list. */
+  scope: Scope | null
+  period: Period
+}
+
 export default function App() {
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null)
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null)
@@ -47,9 +66,13 @@ export default function App() {
   const [period, setPeriod] = useState<Period>('daily')
   const [force, setForce] = useState(false)
   const [maxMessages, setMaxMessages] = useState(600)
-  const [busy, setBusy] = useState<'capture' | 'digest' | null>(null)
-  const [discovering, setDiscovering] = useState(false)
-  const [digestNonce, setDigestNonce] = useState(0)
+  /** Only set while the enqueue POST is in flight: jobs never block a button. */
+  const [enqueuing, setEnqueuing] = useState<'capture' | 'digest' | 'discover' | null>(null)
+  const [watched, setWatched] = useState<WatchedRun | null>(null)
+  const [lastRun, setLastRun] = useState<LastRun | null>(null)
+  /** Inline refusal from the API (e.g. a digest range with no messages). */
+  const [notice, setNotice] = useState<string | null>(null)
+  const [channelNames, setChannelNames] = useState<Record<string, string>>({})
 
   const debouncedQuery = useDebouncedValue(channelQuery, 220)
 
@@ -68,17 +91,20 @@ export default function App() {
   const channels = useMemo(() => channelsState.data ?? [], [channelsState.data])
 
   const activityState = useAsync(
-    (signal) => fetchChannelActivity(selectedChannelId ?? '', windowDays, signal),
+    (signal) => fetchChannelActivitySafe(selectedChannelId, windowDays, signal),
     [selectedChannelId, windowDays],
     { enabled: selectedChannelId !== null },
   )
 
   const digestsState = useAsync(
-    (signal) => fetchChannelDigests(selectedChannelId ?? '', signal),
-    [selectedChannelId, digestNonce],
+    (signal) => fetchChannelDigestsSafe(selectedChannelId, signal),
+    [selectedChannelId],
     { enabled: selectedChannelId !== null },
   )
   const digests = digestsState.data ?? []
+
+  // Queue state: the list refreshes itself every 5s while anything is active.
+  const recentJobs = useRecentJobs(8)
 
   const selectedChannel = useMemo<ChannelSummary | null>(() => {
     if (selectedChannelId === null) return null
@@ -95,10 +121,38 @@ export default function App() {
     )
   }, [servers, channels, selectedServerId, selectedChannel])
 
+  // Job rows only carry a channel id, so remember every name we have seen.
+  useEffect(() => {
+    const seen = [selectedChannel, ...channels].filter(
+      (channel): channel is ChannelSummary => channel !== null,
+    )
+    if (seen.length === 0) return
+    setChannelNames((previous) => {
+      let changed = false
+      const next = { ...previous }
+      for (const channel of seen) {
+        if (next[channel.id] !== channel.name) {
+          next[channel.id] = channel.name
+          changed = true
+        }
+      }
+      return changed ? next : previous
+    })
+  }, [channels, selectedChannel])
+
+  const channelLabel = useCallback(
+    (channelId: string | null) => {
+      if (channelId === null) return '—'
+      return channelNames[channelId] ?? channelId
+    },
+    [channelNames],
+  )
+
   /** Selecting a channel resets the range so the user starts from real activity. */
   const selectChannel = useCallback((channel: ChannelSummary | null) => {
     setSelectedChannelId(channel?.id ?? null)
     setRange({ from: null, to: null })
+    setNotice(null)
   }, [])
 
   /** First click starts a range, second click closes it (clicking earlier flips it). */
@@ -110,6 +164,85 @@ export default function App() {
         : { from: day, to: previous.from }
     })
   }, [])
+
+  const changeRange = useCallback((next: RangeSelection) => {
+    setRange(next)
+    setNotice(null)
+  }, [])
+
+  const scopeFor = useCallback(
+    (from: string | null, to: string | null, selectedPeriod: Period) =>
+      summariseScope({
+        activity: activityState.data,
+        from,
+        to,
+        period: selectedPeriod,
+        windowDays,
+      }),
+    [activityState.data, windowDays],
+  )
+
+  /**
+   * Completion path: stop polling (the hook already did), refresh everything the
+   * run touched, keep the per-period outcome in the panel and toast once.
+   */
+  const handleSettled = useCallback(
+    (job: JobStatus) => {
+      recentJobs.reload()
+      serversState.reload()
+      if (job.kind === 'discover') {
+        if (selectedServerId !== null) channelsState.reload()
+      } else {
+        channelsState.reload()
+        if (job.channelId !== null && job.channelId === selectedChannelId) {
+          activityState.reload()
+          digestsState.reload()
+        }
+      }
+
+      if (watched && watched.scope && job.kind !== 'discover' && job.channelId !== null) {
+        setLastRun({ job, scope: watched.scope, channelId: job.channelId, period: watched.period })
+      }
+
+      const headline = jobHeadline(
+        job,
+        job.channelId === null ? null : (channelNames[job.channelId] ?? null),
+      )
+      if (headline.tone === 'error') {
+        toast.error(headline.title, { description: headline.description })
+      } else {
+        toast.success(headline.title, { description: headline.description })
+      }
+    },
+    [
+      activityState,
+      channelNames,
+      channelsState,
+      digestsState,
+      recentJobs,
+      selectedChannelId,
+      selectedServerId,
+      serversState,
+      watched,
+    ],
+  )
+
+  const watcher = useJobWatcher(watched?.jobId ?? null, handleSettled)
+
+  const activeJobs = useMemo(() => recentJobs.jobs.filter(isJobActive), [recentJobs.jobs])
+  /** A job queued in this tab is "active" before the list has caught up. */
+  const trackedActive = watched !== null && (watcher.job === null || isJobActive(watcher.job))
+
+  const isRunningFor = useCallback(
+    (kind: JobKind, channelId: string | null) =>
+      activeJobs.some((job) => job.kind === kind && job.channelId === channelId) ||
+      (trackedActive && watched?.kind === kind && watched.channelId === channelId),
+    [activeJobs, trackedActive, watched],
+  )
+
+  const captureRunning = isRunningFor('capture', selectedChannelId)
+  const digestRunning = isRunningFor('digest', selectedChannelId)
+  const discoverRunning = isRunningFor('discover', null)
 
   useEffect(() => {
     if (serversState.error) toast.error(`Could not load servers: ${serversState.error.message}`)
@@ -127,70 +260,149 @@ export default function App() {
     if (digestsState.error) toast.error(`Could not load digests: ${digestsState.error.message}`)
   }, [digestsState.error])
 
-  const runDiscover = async () => {
-    setDiscovering(true)
-    const toastId = toast.loading('Asking Discord for every server and channel…')
-    try {
-      const result = await discoverChannels()
-      serversState.reload()
-      if (selectedServerId) channelsState.reload()
-      if (result.ok) toast.success(result.status, { id: toastId })
-      else toast.error(result.status, { id: toastId })
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Discover failed', { id: toastId })
-    } finally {
-      setDiscovering(false)
+  // A failed poll is reported once; the hooks stop polling at that point.
+  useEffect(() => {
+    if (recentJobs.error) {
+      toast.error(`Could not read the job list: ${recentJobs.error.message}`)
     }
-  }
+  }, [recentJobs.error])
+
+  useEffect(() => {
+    if (watcher.error) {
+      toast.error(`Lost track of the running job: ${watcher.error.message}`)
+    }
+  }, [watcher.error])
+
+  /** Shared tail of every enqueue: adopt the job, refresh the list, announce it. */
+  const adoptJob = useCallback(
+    (jobId: number, run: Omit<WatchedRun, 'jobId'>) => {
+      setWatched({ jobId, ...run })
+      recentJobs.reload()
+    },
+    [recentJobs],
+  )
+
+  const reportRefusal = useCallback((reason: string) => {
+    setNotice(reason)
+    toast.error('Nothing was queued', { description: reason })
+  }, [])
 
   const runCapture = async () => {
     if (!selectedChannel) return
-    setBusy('capture')
-    const toastId = toast.loading(`Capturing #${selectedChannel.name}…`)
+    setEnqueuing('capture')
+    setNotice(null)
+    const scope = scopeFor(range.from, range.to, period)
     try {
-      const result = await captureMessages({
+      const result = await queueCapture({
         channelId: selectedChannel.id,
         since: range.from ?? undefined,
         until: range.to ?? undefined,
         maxMessages,
       })
-      toast[result.ok ? 'success' : 'error'](result.status, { id: toastId })
-      if (result.ok) {
-        channelsState.reload()
-        activityState.reload()
-        serversState.reload()
+      if (result.jobId === null) {
+        reportRefusal(result.status)
+        return
       }
+      adoptJob(result.jobId, {
+        kind: 'capture',
+        channelId: selectedChannel.id,
+        channelName: selectedChannel.name,
+        scope,
+        period,
+      })
+      toast.message('Capture queued', {
+        description: `${scopeRangeLabel(scope)} · progress is shown above, the buttons stay usable`,
+      })
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Capture failed', { id: toastId })
+      toast.error(error instanceof Error ? error.message : 'Capture could not be queued')
     } finally {
-      setBusy(null)
+      setEnqueuing(null)
     }
   }
 
   const runDigest = async () => {
     if (!selectedChannel || !range.from) return
-    setBusy('digest')
-    const toastId = toast.loading(`Building ${period} digest for #${selectedChannel.name}…`)
+    setEnqueuing('digest')
+    setNotice(null)
+    const scope = scopeFor(range.from, range.to, period)
     try {
-      const result = await generateDigest({
+      const result = await queueDigest({
         channelId: selectedChannel.id,
         from: range.from,
         to: range.to ?? undefined,
         period,
         force,
       })
-      toast[result.ok ? 'success' : 'error'](result.status, { id: toastId })
-      if (result.ok) {
-        setDigestNonce((value) => value + 1)
-        channelsState.reload()
-        serversState.reload()
+      if (result.jobId === null) {
+        reportRefusal(result.status)
+        return
       }
+      adoptJob(result.jobId, {
+        kind: 'digest',
+        channelId: selectedChannel.id,
+        channelName: selectedChannel.name,
+        scope,
+        period,
+      })
+      toast.message('Digest queued', {
+        description: `${scopeRangeLabel(scope)} · ${period} · progress is shown above`,
+      })
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Digest failed', { id: toastId })
+      toast.error(error instanceof Error ? error.message : 'Digest could not be queued')
     } finally {
-      setBusy(null)
+      setEnqueuing(null)
     }
   }
+
+  const runDiscover = async () => {
+    setEnqueuing('discover')
+    try {
+      const result = await queueDiscover()
+      if (result.jobId === null) {
+        reportRefusal(result.status)
+        return
+      }
+      adoptJob(result.jobId, {
+        kind: 'discover',
+        channelId: null,
+        channelName: null,
+        scope: null,
+        period,
+      })
+      toast.message('Discover queued', {
+        description: 're-reading servers and channels from Discord in the background',
+      })
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Discover could not be queued')
+    } finally {
+      setEnqueuing(null)
+    }
+  }
+
+  const widenWindow = useCallback((days: number) => setWindowDays(windowPresetFor(days)), [])
+
+  /** Shown until the first poll lands, so a queue action has instant feedback. */
+  const progressJob: JobStatus | null =
+    watcher.job ??
+    (watched
+      ? {
+          id: watched.jobId,
+          kind: watched.kind,
+          status: 'queued',
+          phase: 'queued',
+          messages: 0,
+          percent: null,
+          message: '',
+          channelId: watched.channelId,
+          createdAt: null,
+          updatedAt: null,
+          finishedAt: null,
+        }
+      : null)
+
+  const progressScopeNote = watched?.scope
+    ? `${scopeRangeLabel(watched.scope)} · ${watched.period} · ${watched.scope.dayCount} day${watched.scope.dayCount === 1 ? '' : 's'} · ${formatCompact(watched.scope.activeDays)} with messages`
+    : null
 
   const today = toIsoDay(new Date())
 
@@ -209,6 +421,12 @@ export default function App() {
           </div>
         </div>
         <div className="ml-auto flex items-center gap-2">
+          {activeJobs.length > 0 && (
+            <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
+              <Loader2Icon className="size-3 animate-spin" />
+              {activeJobs.length} job{activeJobs.length === 1 ? '' : 's'} running
+            </span>
+          )}
           {serversState.refreshing && (
             <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
               <Loader2Icon className="size-3 animate-spin" /> reloading
@@ -218,9 +436,14 @@ export default function App() {
             variant="outline"
             size="sm"
             onClick={() => void runDiscover()}
-            disabled={discovering}
+            disabled={enqueuing === 'discover' || discoverRunning}
+            title={
+              discoverRunning
+                ? 'a discover job is already queued or running'
+                : 'queue a background discover run'
+            }
           >
-            {discovering ? (
+            {enqueuing === 'discover' ? (
               <Loader2Icon className="animate-spin" />
             ) : (
               <RefreshCwIcon className="size-3.5" />
@@ -243,6 +466,7 @@ export default function App() {
             setSelectedChannelId(null)
             setRange({ from: null, to: null })
             setNudgeChannelPicker(true)
+            setNotice(null)
           }}
           onRefresh={serversState.reload}
         />
@@ -288,6 +512,20 @@ export default function App() {
             )}
           </div>
 
+          {progressJob && (
+            <JobProgressCard
+              job={progressJob}
+              channelName={
+                watched?.channelName ??
+                (watched?.channelId ? channelLabel(watched.channelId) : null)
+              }
+              scopeNote={progressScopeNote}
+              polling={watcher.polling}
+              error={watcher.error}
+              onDismiss={() => setWatched(null)}
+            />
+          )}
+
           {selectedChannel === null ? (
             <Card className="flex-1">
               <CardHeader>
@@ -318,7 +556,7 @@ export default function App() {
                     fromDay={range.from}
                     toDay={range.to}
                     onPickDay={pickDay}
-                    onClearRange={() => setRange({ from: null, to: null })}
+                    onClearRange={() => changeRange({ from: null, to: null })}
                   />
                 </CardContent>
               </Card>
@@ -327,14 +565,24 @@ export default function App() {
                 channel={selectedChannel}
                 activity={activityState.data}
                 range={range}
-                onRangeChange={setRange}
+                onRangeChange={changeRange}
                 period={period}
-                onPeriodChange={setPeriod}
+                onPeriodChange={(next) => {
+                  setPeriod(next)
+                  setNotice(null)
+                }}
                 force={force}
                 onForceChange={setForce}
                 maxMessages={maxMessages}
                 onMaxMessagesChange={setMaxMessages}
-                busy={busy}
+                windowDays={windowDays}
+                onWidenWindow={widenWindow}
+                enqueuing={enqueuing === 'capture' || enqueuing === 'digest' ? enqueuing : null}
+                captureRunning={captureRunning}
+                digestRunning={digestRunning}
+                lastRun={lastRun}
+                onDismissLastRun={() => setLastRun(null)}
+                notice={notice}
                 onCapture={() => void runCapture()}
                 onGenerate={() => void runDigest()}
               />
@@ -355,6 +603,28 @@ export default function App() {
             </>
           )}
 
+          <JobsPanel
+            jobs={recentJobs.jobs}
+            loading={recentJobs.loading || recentJobs.refreshing}
+            polling={recentJobs.polling}
+            error={recentJobs.error}
+            channelLabel={channelLabel}
+            onReload={recentJobs.reload}
+            watchingJobId={watched?.jobId ?? null}
+            onWatch={(jobId) => {
+              const job = recentJobs.jobs.find((candidate) => candidate.id === jobId)
+              if (!job) return
+              setWatched({
+                jobId,
+                kind: job.kind,
+                channelId: job.channelId,
+                channelName: job.channelId === null ? null : channelLabel(job.channelId),
+                scope: null,
+                period,
+              })
+            }}
+          />
+
           <Separator />
           <footer className="flex flex-wrap items-center gap-2 pb-2 text-[11px] text-muted-foreground">
             <span>today is {today}</span>
@@ -369,4 +639,17 @@ export default function App() {
       <Toaster theme="dark" position="bottom-right" closeButton richColors />
     </div>
   )
+}
+
+/* Thin wrappers keep the hook dependencies honest (channel id, never a closure). */
+function fetchChannelActivitySafe(
+  channelId: string | null,
+  windowDays: number,
+  signal: AbortSignal,
+) {
+  return fetchChannelActivity(channelId ?? '', windowDays, signal)
+}
+
+function fetchChannelDigestsSafe(channelId: string | null, signal: AbortSignal) {
+  return fetchChannelDigests(channelId ?? '', signal)
 }

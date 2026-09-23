@@ -25,6 +25,13 @@ export function formatDay(value: string | null | undefined): string {
   return date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
 }
 
+/** Compact "Sep 17" for day chips and timelines. */
+export function formatDayShort(value: string | null | undefined): string {
+  const date = parseDay(value)
+  if (!date) return '—'
+  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
 export function formatDateTime(value: string | null | undefined): string {
   if (!value) return 'never'
   const date = new Date(value)

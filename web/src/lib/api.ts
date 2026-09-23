@@ -60,6 +60,8 @@ export interface Digest {
 export interface ActionStatus {
   ok: boolean
   status: string
+  /** Set when the action was queued as a background job. */
+  jobId: number | null
 }
 
 export interface ServerListResponse {
@@ -205,6 +207,7 @@ function parseStatus(value: unknown, ok = true): ActionStatus {
   return {
     ok: typeof row.ok === 'boolean' ? row.ok : ok,
     status: asString(row.status, 'done'),
+    jobId: typeof row.jobId === 'number' ? row.jobId : null,
   }
 }
 
@@ -394,6 +397,90 @@ export async function generateDigest(
   return parseStatus(await requestRaw('/api/digest', { timeoutMs: LONG_TIMEOUT_MS, method: 'POST', body, signal }))
 }
 
+/* ------------------------------------------------------------------ */
+/* The job queue: every capture/digest/discover run goes through here. */
+/* ------------------------------------------------------------------ */
+
+/** Body of POST /api/jobs. Only the keys relevant to `kind` are sent. */
+export interface JobRequest {
+  kind: JobKind
+  channelId?: string
+  since?: string
+  until?: string
+  maxMessages?: number
+  /** Sent under the `from` key: Python keywords make the API use an alias. */
+  from?: string
+  to?: string
+  period?: Period
+  force?: boolean
+}
+
+/**
+ * Result of POST /api/jobs.
+ *
+ * `jobId` is null when the API accepted the request but refused to queue work
+ * (a digest range with no captured messages, for example); `status` then holds
+ * the reason, which belongs inline next to the button that failed.
+ */
+export interface JobQueueResult {
+  jobId: number | null
+  ok: boolean
+  status: string
+}
+
+/**
+ * POST /api/jobs - queue work and return immediately.
+ *
+ * The worker reports progress on `GET /api/jobs/<id>`, so this call is never
+ * given the long timeout the old blocking endpoints needed.
+ */
+export async function createJob(body: JobRequest, signal?: AbortSignal): Promise<JobQueueResult> {
+  const row = asRecord(await requestRaw('/api/jobs', { method: 'POST', body, signal }))
+  const jobId = asJobId(row.jobId ?? row.id)
+  return {
+    jobId,
+    ok: typeof row.ok === 'boolean' ? row.ok : jobId !== null,
+    status: asString(row.status, jobId === null ? 'the API queued no job' : 'queued'),
+  }
+}
+
+/** POST /api/jobs with kind=capture. */
+export function queueCapture(
+  body: CaptureRequest,
+  signal?: AbortSignal,
+): Promise<JobQueueResult> {
+  return createJob(
+    {
+      kind: 'capture',
+      channelId: body.channelId,
+      since: body.since,
+      until: body.until,
+      maxMessages: body.maxMessages,
+    },
+    signal,
+  )
+}
+
+/** POST /api/jobs with kind=digest. */
+export function queueDigest(body: DigestRequest, signal?: AbortSignal): Promise<JobQueueResult> {
+  return createJob(
+    {
+      kind: 'digest',
+      channelId: body.channelId,
+      from: body.from,
+      to: body.to,
+      period: body.period,
+      force: body.force,
+    },
+    signal,
+  )
+}
+
+/** POST /api/jobs with kind=discover. */
+export function queueDiscover(signal?: AbortSignal): Promise<JobQueueResult> {
+  return createJob({ kind: 'discover' }, signal)
+}
+
 /** POST /api/discover */
 export async function discoverChannels(signal?: AbortSignal): Promise<ActionStatus> {
   return parseStatus(await requestRaw('/api/discover', { timeoutMs: LONG_TIMEOUT_MS, method: 'POST', body: {}, signal }))
@@ -406,4 +493,67 @@ export async function askQuestion(
 ): Promise<AskResponse> {
   const payload = asRecord(await requestRaw('/api/ask', { method: 'POST', body, signal }))
   return { answer: asString(payload.answer, 'No answer returned.') }
+}
+
+/* ------------------------------------------------------------------ */
+/* Background jobs                                                     */
+/* ------------------------------------------------------------------ */
+
+export type JobKind = 'capture' | 'digest' | 'discover' | 'other'
+export type JobState = 'queued' | 'running' | 'done' | 'error'
+
+export interface JobStatus {
+  id: number
+  kind: JobKind
+  status: JobState
+  phase: string
+  message: string
+  messages: number
+  /** Null when the job cannot estimate progress (e.g. discover). */
+  percent: number | null
+  channelId: string | null
+  createdAt: string | null
+  updatedAt: string | null
+  finishedAt: string | null
+}
+
+function parseJob(value: unknown): JobStatus {
+  const row = asRecord(value)
+  const kind = asString(row.kind, 'other')
+  const status = asString(row.status, 'queued')
+  return {
+    id: asNumber(row.id),
+    kind: (['capture', 'digest', 'discover'].includes(kind) ? kind : 'other') as JobKind,
+    status: (['queued', 'running', 'done', 'error'].includes(status) ? status : 'queued') as JobState,
+    phase: asString(row.phase),
+    message: asString(row.message),
+    messages: asNumber(row.messages),
+    percent: typeof row.percent === 'number' ? row.percent : null,
+    channelId: asNullableString(row.channelId),
+    createdAt: asNullableString(row.createdAt),
+    updatedAt: asNullableString(row.updatedAt),
+    finishedAt: asNullableString(row.finishedAt),
+  }
+}
+
+/** A job still worth polling. */
+export function isJobActive(job: JobStatus): boolean {
+  return job.status === 'queued' || job.status === 'running'
+}
+
+/** GET /api/jobs/<id> */
+export async function getJob(id: number, signal?: AbortSignal): Promise<JobStatus> {
+  return parseJob(await requestRaw(`/api/jobs/${id}`, { signal }))
+}
+
+/** GET /api/jobs?limit= */
+export async function listJobs(
+  options: { limit?: number } = {},
+  signal?: AbortSignal,
+): Promise<JobStatus[]> {
+  const payload = await requestRaw('/api/jobs', {
+    query: { limit: options.limit ?? 10 },
+    signal,
+  })
+  return asList(payload, 'jobs').map(parseJob)
 }
