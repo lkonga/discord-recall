@@ -28,9 +28,15 @@ dev = [
     "pytest-asyncio",
     "ruff",
 ]
+web = [
+    "fastapi>=0.115",
+    "python-multipart>=0.0.9",
+    "uvicorn[standard]>=0.30",
+]
 
 [project.scripts]
 discord-recall = "discord_recall.cli:app"
+discord-recall-web = "discord_recall.web.app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/discord_recall"]

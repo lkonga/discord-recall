@@ -16,3 +16,6 @@ __pycache__/
 # Editor / tooling
 .claude/
 .context/
+
+# Deployment artifacts
+data/

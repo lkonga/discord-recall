@@ -1,19 +1,31 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: discord_recall
-      POSTGRES_PASSWORD: discord_recall
-      POSTGRES_DB: discord_recall
+  recall:
+    build: .
+    image: discord-recall:latest
+    restart: unless-stopped
+    # loopback only; expose over tailscale serve (see PATCHES.md / deployment notes)
     ports:
-      - "5433:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U discord_recall"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
+      - "127.0.0.1:${HOST_PORT:-9879}:9879"
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////data/discord_recall.db
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      SERVER_IDS: ${SERVER_IDS:-[]}
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_API_KEY: ${LLM_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      DIGEST_CHANNELS: ${DIGEST_CHANNELS:-}
+      SEND_TELEGRAM: ${SEND_TELEGRAM:-false}
+      BACKFILL_DAYS: ${BACKFILL_DAYS:-2}
+      DIGEST_DAYS: ${DIGEST_DAYS:-3}
+      MAX_MESSAGES: ${MAX_MESSAGES:-600}
+      BACKFILL_BATCH_SIZE: ${BACKFILL_BATCH_SIZE:-100}
+      BACKFILL_DELAY_SECONDS: ${BACKFILL_DELAY_SECONDS:-1.5}
+      SCHEDULE_INTERVAL_SECONDS: ${SCHEDULE_INTERVAL_SECONDS:-21600}
+      RUN_SCHEDULER: ${RUN_SCHEDULER:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
 volumes:
-  pgdata:
+  recall-data:
