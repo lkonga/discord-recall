@@ -577,9 +577,23 @@ function asPercent(value: unknown): number | null {
   return Math.min(100, Math.max(0, Math.round(scaled * 10) / 10))
 }
 
+/**
+ * Job timestamps are UTC instants serialized without a timezone suffix (the
+ * store drops tzinfo), e.g. "2026-09-23T19:57:12.345". Read as-is that is 5.5
+ * hours off for this user, so a bare instant is marked as UTC. Values that
+ * already carry `Z` or an offset are left untouched.
+ */
+function asUtcInstant(value: unknown): string | null {
+  const raw = asNullableString(value)
+  if (!raw) return null
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(raw)) return raw
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(raw)) return `${raw}Z`
+  return raw
+}
+
 function parseJob(value: unknown): JobStatus {
   const row = asRecord(value)
-  const finishedAt = asNullableString(row.finishedAt ?? row.finished_at)
+  const finishedAt = asUtcInstant(row.finishedAt ?? row.finished_at)
   return {
     id: asJobId(row.id ?? row.jobId) ?? 0,
     kind: asJobKind(row.kind),
@@ -589,8 +603,8 @@ function parseJob(value: unknown): JobStatus {
     messages: asNumber(row.messages),
     percent: asPercent(row.percent ?? row.progress),
     channelId: asNullableString(row.channelId ?? row.channel_id),
-    createdAt: asNullableString(row.createdAt ?? row.created_at),
-    updatedAt: asNullableString(row.updatedAt ?? row.updated_at),
+    createdAt: asUtcInstant(row.createdAt ?? row.created_at),
+    updatedAt: asUtcInstant(row.updatedAt ?? row.updated_at),
     finishedAt,
   }
 }

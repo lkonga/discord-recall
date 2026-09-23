@@ -61,7 +61,7 @@ export interface Scope {
   end: string | null
   /** True only when both ends are set. */
   bothEnds: boolean
-  /** Day chips, capped at MAX_SCOPE_CHIPS. */
+  /** Day chips, capped at MAX_SCOPE_CHIPS (the most recent days of the range). */
   days: ScopeDay[]
   dayCount: number
   truncated: boolean
@@ -211,7 +211,9 @@ export function summariseScope(options: SummariseScopeOptions): Scope {
     start,
     end,
     bothEnds,
-    days: allDays.slice(0, MAX_SCOPE_CHIPS),
+    // For a very long range the newest days are the ones worth showing, so the
+    // chips keep the tail of the range and the panel says how many were hidden.
+    days: allDays.slice(-MAX_SCOPE_CHIPS),
     dayCount: allDays.length,
     truncated: allDays.length > MAX_SCOPE_CHIPS,
     messages,

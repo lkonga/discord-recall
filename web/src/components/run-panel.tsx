@@ -289,13 +289,7 @@ export function RunPanel({
                 </span>
                 <div className="flex flex-wrap gap-1">
                   {scope.days.map((day) => {
-                    const selected = Boolean(
-                      scope.start &&
-                        scope.end &&
-                        day.date >= scope.start &&
-                        day.date <= scope.end &&
-                        (range.from === day.date || range.to === day.date),
-                    )
+                    const selected = range.from === day.date || range.to === day.date
                     return (
                       <button
                         key={day.date}
@@ -319,8 +313,8 @@ export function RunPanel({
                 </div>
                 {scope.truncated && (
                   <span className="text-[11px] text-muted-foreground">
-                    showing the first {formatCount(scope.days.length)} of{' '}
-                    {formatCount(scope.dayCount)} days
+                    showing the last {formatCount(scope.days.length)} of{' '}
+                    {formatCount(scope.dayCount)} days in this range
                   </span>
                 )}
               </div>
@@ -347,7 +341,7 @@ export function RunPanel({
               </div>
             )}
 
-            {!disabled && range.from && scope.messages === 0 && (
+            {!disabled && range.from && scope.messages === 0 && !scope.outsideWindow && (
               <div className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-[11px]">
                 <span>
                   Nothing captured in {rangeLabel} yet, so a digest here would be empty.

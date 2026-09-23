@@ -214,6 +214,21 @@ export function jobHeadline(job: JobStatus, channelLabel?: string | null): JobHe
         description,
       }
     }
+    // A run that built something ends with a per-period line, not the totals
+    // line, so report the counts the named periods give us instead of nothing.
+    if (summary && summary.entries.length > 0) {
+      const count = (outcome: DigestEntryOutcome) =>
+        summary.entries.filter((entry) => entry.outcome === outcome).length
+      const parts: string[] = []
+      if (count('built') > 0) parts.push(`${formatCount(count('built'))} built`)
+      if (count('reused') > 0) parts.push(`${formatCount(count('reused'))} reused`)
+      if (count('failed') > 0) parts.push(`${formatCount(count('failed'))} failed`)
+      return {
+        tone: count('failed') > 0 ? 'error' : 'success',
+        title: parts.length > 0 ? `digest: ${parts.join(', ')}` : 'digest finished',
+        description,
+      }
+    }
     return { tone: 'success', title: 'digest finished', description }
   }
 
