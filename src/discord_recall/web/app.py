@@ -15,7 +15,7 @@ import pathlib
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from urllib.parse import quote_plus
 
 from discord_recall.db import get_session_factory
@@ -27,6 +27,14 @@ app = FastAPI(title="Discord Recall", docs_url=None, redoc_url=None)
 from discord_recall.web.api import router as api_router  # noqa: E402
 
 app.include_router(api_router)
+
+_DIST = pathlib.Path(
+    os.environ.get(
+        "WEB_DIST",
+        str(pathlib.Path(__file__).resolve().parents[3] / "web" / "dist"),
+    )
+)
+
 
 
 from discord_recall.web.runner import last_line as _last_line  # noqa: E402
@@ -85,7 +93,14 @@ async def healthz():
 
 @app.get("/", response_class=HTMLResponse)
 async def index(msg: str = "", q: str = ""):
-    """Channel picker: every channel the account knows about, filterable."""
+    """Serve the built React app when present, else the HTML fallback."""
+    if (_DIST / "index.html").exists():
+        return FileResponse(_DIST / "index.html")
+    return await html_index(msg=msg, q=q)
+
+
+async def html_index(msg: str = "", q: str = ""):
+    """Server-rendered fallback picker (used only without a frontend build)."""
     factory = get_session_factory()
     async with factory() as session:
         msg_count = (
@@ -367,15 +382,8 @@ if __name__ == "__main__":  # pragma: no cover
     main()
 
 # --- SPA hosting -----------------------------------------------------------
-# The built React/shadcn app (web/dist) is mounted last so every /api route and
-# /healthz above keeps priority. Without a build, the server-rendered pages
-# below still work as a fallback.
-_DIST = pathlib.Path(
-    os.environ.get(
-        "WEB_DIST",
-        str(pathlib.Path(__file__).resolve().parents[3] / "web" / "dist"),
-    )
-)
+# The built React/shadcn app is mounted last so every /api route and /healthz
+# keeps priority; its index.html is served for "/" by the root route above.
 if (_DIST / "index.html").exists():
     from fastapi.staticfiles import StaticFiles
 
