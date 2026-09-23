@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ChevronsUpDownIcon, HashIcon, SearchIcon } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
@@ -25,6 +25,9 @@ interface ChannelComboboxProps {
   query: string
   onQueryChange: (query: string) => void
   onSelect: (channel: ChannelSummary | null) => void
+  /** Open the list once after a server is picked, so the next step is obvious. */
+  autoOpen?: boolean
+  onAutoOpen?: () => void
 }
 
 /**
@@ -40,8 +43,17 @@ export function ChannelCombobox({
   query,
   onQueryChange,
   onSelect,
+  autoOpen = false,
+  onAutoOpen,
 }: ChannelComboboxProps) {
   const [open, setOpen] = useState(false)
+
+  // Choosing a server should not leave the user staring at a closed dropdown.
+  useEffect(() => {
+    if (!autoOpen || !serverName || open) return
+    setOpen(true)
+    onAutoOpen?.()
+  }, [autoOpen, serverName, open, onAutoOpen])
   const selected = channels.find((channel) => channel.id === selectedChannelId) ?? null
   const active = channels.filter((channel) => channel.messages > 0)
   const inactive = channels.filter((channel) => channel.messages === 0)
@@ -73,7 +85,9 @@ export function ChannelCombobox({
           <span className="flex min-w-0 items-center gap-2 text-muted-foreground">
             <SearchIcon className="size-3.5 shrink-0" />
             <span className="truncate">
-              {serverName ? `Search channels in ${serverName}` : 'Select a server first'}
+              {serverName
+                ? `Choose a channel in ${serverName} (${channels.length})`
+                : 'Select a server first'}
             </span>
           </span>
         )}

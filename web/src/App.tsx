@@ -40,6 +40,7 @@ const DEFAULT_ACTIVITY_WINDOW = 90
 export default function App() {
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null)
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null)
+  const [nudgeChannelPicker, setNudgeChannelPicker] = useState(false)
   const [channelQuery, setChannelQuery] = useState('')
   const [windowDays, setWindowDays] = useState(DEFAULT_ACTIVITY_WINDOW)
   const [range, setRange] = useState<RangeSelection>({ from: null, to: null })
@@ -241,6 +242,7 @@ export default function App() {
             setChannelQuery('')
             setSelectedChannelId(null)
             setRange({ from: null, to: null })
+            setNudgeChannelPicker(true)
           }}
           onRefresh={serversState.reload}
         />
@@ -256,6 +258,8 @@ export default function App() {
                 query={channelQuery}
                 onQueryChange={setChannelQuery}
                 onSelect={selectChannel}
+                autoOpen={nudgeChannelPicker}
+                onAutoOpen={() => setNudgeChannelPicker(false)}
               />
               {selectedServerId === null && (
                 <span className="text-xs text-muted-foreground">
