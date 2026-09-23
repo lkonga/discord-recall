@@ -17,7 +17,8 @@ step "backend: ruff"
 uv run ruff check src tests scripts
 
 step "backend: pytest"
-uv run python -m pytest tests/ -q
+# --extra dev so the gate works even if the venv was synced without dev deps
+uv run --extra dev python -m pytest tests/ -q
 
 if $fast; then
   printf '\nfast mode: skipping the frontend build\n'
