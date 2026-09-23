@@ -45,8 +45,17 @@ _COMPLETE_RE = re.compile(r"Backfill complete[^\d]{0,6}(\d+) messages")
 _DISCOVER_RE = re.compile(r"discovered (\d+) servers, (\d+) text channels")
 _DIGEST_RE = re.compile(r"(\d+) built, (\d+) reused")
 _LIMIT_RE = re.compile(r"rate limited|429", re.IGNORECASE)
+# A rejected token must stop the queue: every further attempt is an invalid
+# request, and Discord bans on 10k invalid requests per 10 minutes.
+_AUTH_RE = re.compile(r"\b401\b|unauthori[sz]ed|improper token|invalid token", re.I)
 
 _stop = False
+_auth_failed = False
+
+
+def auth_failed() -> bool:
+    """True once the token was rejected; the queue stays paused until restart."""
+    return _auth_failed
 
 
 def _now() -> datetime:
@@ -179,7 +188,12 @@ def build_args(job: Job) -> list[str]:
 
 
 class RateLimitAbort(RuntimeError):
-    """Raised when the run must stop: too many 429s, or a global/CF block."""
+    """Raised when the run must stop: too many 429s, a global/CF block, or the
+    per-run request budget being spent, or a rejected token."""
+
+
+class RequestBudgetExceeded(RateLimitAbort):
+    """The run hit PACE_MAX_REQUESTS before reaching its message cap."""
 
 
 async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
@@ -198,6 +212,7 @@ async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
     lines: list[str] = []
     cooldowns = 0
     rate_limited = False
+    requests_est = 0
     assert proc.stdout is not None
     async for raw in proc.stdout:
         line = raw.decode(errors="replace").rstrip()
@@ -206,12 +221,42 @@ async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
         lines.append(line)
         messages = _MESSAGES_RE.search(line)
         if messages:
+            fetched = int(messages.group(1))
+            # Requests, not messages, are the scarce unit: a page is PACE_BATCH
+            # messages, so bound the run by the researched request budget too.
+            requests_est = fetched // max(1, PACE_BATCH) + 1
+            if requests_est > PACE_MAX_REQUESTS:
+                proc.kill()
+                await _update(
+                    job.id,
+                    phase="aborted",
+                    message=(
+                        f"stopped at {requests_est} requests "
+                        f"(budget {PACE_MAX_REQUESTS}/run); lower the cap or raise "
+                        f"PACE_MAX_REQUESTS deliberately"
+                    ),
+                )
+                logger.error(
+                    f"job {job.id}: request budget exceeded ({requests_est} > {PACE_MAX_REQUESTS})"
+                )
+                raise RequestBudgetExceeded(f"{requests_est} requests > {PACE_MAX_REQUESTS}")
             await _update(
                 job.id,
                 phase="capturing",
-                messages=int(messages.group(1)),
+                messages=fetched,
                 message=line[-200:],
             )
+        elif _AUTH_RE.search(line):
+            global _auth_failed
+            _auth_failed = True
+            proc.kill()
+            await _update(
+                job.id,
+                phase="token rejected",
+                message="Discord rejected the token (401): queue paused, fix DISCORD_TOKEN and restart",
+            )
+            logger.error(f"job {job.id}: token rejected - pausing the queue")
+            raise RateLimitAbort("token rejected (401) - queue paused")
         elif _LIMIT_RE.search(line):
             cooldowns += 1
             rate_limited = True
@@ -266,7 +311,7 @@ async def _execute(job: Job) -> bool:
         await _update(
             job.id,
             status=JobStatus.error.value,
-            phase="rate limited",
+            phase="stopped",
             message=f"stopped to protect the token: {exc}",
             finished_at=_now(),
         )
@@ -315,11 +360,15 @@ async def worker_loop() -> None:
     """Single worker: one Discord-touching job at a time, forever."""
     logger.info(
         f"job worker started (batch={PACE_BATCH} delay={PACE_DELAY}s"
-        f"+0-{PACE_JITTER_EXTRA}s jitter cap={PACE_MAX_MESSAGES} "
-        f"max-429-strikes={MAX_429_STRIKES})"
+        f"+0-{PACE_JITTER_EXTRA}s jitter cap={PACE_MAX_MESSAGES} msgs "
+        f"budget={PACE_MAX_REQUESTS} requests/run max-429-strikes={MAX_429_STRIKES})"
     )
     while not _stop:
         try:
+            if _auth_failed:
+                # Never keep issuing requests with a rejected token.
+                await asyncio.sleep(60)
+                continue
             job = await _claim()
             if job is None:
                 await asyncio.sleep(POLL_SECONDS)

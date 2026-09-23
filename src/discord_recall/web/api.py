@@ -441,4 +441,17 @@ async def ask(body: AskBody):
 
 @router.get("/health")
 async def health():
-    return {"ok": True}
+    """Liveness plus the pacing state (a paused queue is visible, not silent)."""
+    return {
+        "ok": True,
+        "tokenAccepted": not job_queue.auth_failed(),
+        "pacing": {
+            "batch": job_queue.PACE_BATCH,
+            "delaySeconds": job_queue.PACE_DELAY,
+            "jitterExtraSeconds": job_queue.PACE_JITTER_EXTRA,
+            "maxMessagesPerRun": job_queue.PACE_MAX_MESSAGES,
+            "maxRequestsPerRun": job_queue.PACE_MAX_REQUESTS,
+            "max429Strikes": job_queue.MAX_429_STRIKES,
+            "post429PauseSeconds": job_queue.POST_429_PAUSE,
+        },
+    }
