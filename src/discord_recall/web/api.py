@@ -248,12 +248,49 @@ async def capture(body: CaptureBody):
     return {"ok": rc == 0, "status": last_line(out)}
 
 
+async def _coverage(channel_id: int, start: str, end: str) -> tuple[int, str | None]:
+    """Messages in [start, end] and the most recent day that has any."""
+    factory = get_session_factory()
+    async with factory() as session:
+        count = (
+            await session.execute(
+                select(func.count(Message.id))
+                .where(Message.channel_id == channel_id)
+                .where(func.date(Message.created_at) >= start)
+                .where(func.date(Message.created_at) <= end)
+            )
+        ).scalar_one()
+        latest = (
+            await session.execute(
+                select(func.max(func.date(Message.created_at))).where(
+                    Message.channel_id == channel_id
+                )
+            )
+        ).scalar_one()
+    return int(count or 0), (str(latest) if latest else None)
+
+
 @router.post("/digest")
 async def build_digest(body: DigestBody):
     if not body.channelId.isdigit():
         raise HTTPException(status_code=400, detail="channelId must be a Discord snowflake")
     if body.period not in ("daily", "weekly", "monthly"):
         raise HTTPException(status_code=400, detail="period must be daily, weekly or monthly")
+
+    end = body.to or body.start
+    messages, latest_day = await _coverage(int(body.channelId), body.start, end)
+    if messages == 0:
+        hint = (
+            f"latest captured day is {latest_day} - capture that range first"
+            if latest_day
+            else "this channel has no captured messages yet - run Capture first"
+        )
+        return {
+            "ok": False,
+            "status": f"no messages between {body.start} and {end}: {hint}",
+            "messages": 0,
+            "latestDay": latest_day,
+        }
     args = [
         "digest-range",
         "-c",
@@ -268,7 +305,7 @@ async def build_digest(body: DigestBody):
     if body.force:
         args += ["--force"]
     rc, out = await run_cli(args)
-    return {"ok": rc == 0, "status": last_line(out)}
+    return {"ok": rc == 0, "status": last_line(out), "messages": messages}
 
 
 @router.post("/discover")
