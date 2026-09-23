@@ -301,13 +301,20 @@ export async function listServers(signal?: AbortSignal): Promise<ServerSummary[]
     .filter((server) => server.id !== '')
 }
 
-/** GET /api/channels?server=<id>&q=<text> */
+/**
+ * GET /api/channels?server=<id>&q=<text>
+ *
+ * `limit` is not part of the documented contract but the endpoint defaults to
+ * 300 rows (max 2000, ordered by message count), which would silently hide the
+ * low-traffic channels of a very large server. 2000 is the endpoint maximum and
+ * well above any real guild's channel count, so ask for all of it.
+ */
 export async function listChannels(
-  params: { server?: string; q?: string } = {},
+  params: { server?: string; q?: string; limit?: number } = {},
   signal?: AbortSignal,
 ): Promise<ChannelSummary[]> {
   const payload = await requestRaw('/api/channels', {
-    query: { server: params.server, q: params.q },
+    query: { server: params.server, q: params.q, limit: params.limit ?? 2000 },
     signal,
   })
   return asList(payload, 'channels')

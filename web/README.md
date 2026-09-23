@@ -76,6 +76,28 @@ Note: the legacy server-rendered pages still own the `/` route, so the built SPA
 served at `/index.html` (and any unmatched path) until that route is retired. See the
 "API contract notes" section of the hand-off report for the exact behaviour observed.
 
+## API contract notes
+
+Observed against the deployed backend while building this UI (the client already
+compensates where it can):
+
+- `POST /api/digest` accepts the documented `from` key; the model also exposes `start`
+  via a pydantic alias, so both work. The client sends `from`.
+- `GET /api/channel/<id>/digests` returns an extra `end` per digest that is not in the
+  documented shape. It is typed as optional and rendered as `start → end` when the two
+  days differ.
+- `GET /api/channels` supports an undocumented `limit` (default **300**, max 2000) and
+  orders by message count descending, so the quiet tail of a very large server would be
+  cut off. The client therefore requests `limit=2000`.
+- `GET /api/channel/<id>/activity` caps `days` at 3650; the widest picker window is 1825.
+- Timestamps (`lastMessage`, `latestDigest`, digest `start`/`end`) are naive ISO strings
+  with no offset (`2026-09-20T21:30:00`), so `new Date(...)` reads them as local time.
+- `POST /api/ask` takes `channelId` optionally; a whitespace-only `question` is rejected
+  with 400, which the UI surfaces as a toast.
+- The legacy server-rendered page still owns `/`, so the static mount serves this SPA at
+  `/index.html` (and any unmatched path). `GET /api/health` also exists and returns
+  `{"ok": true}`.
+
 ## Notes on lint configuration
 
 ESLint 10 flat config (`eslint.config.js`) with `typescript-eslint`, `react-hooks`

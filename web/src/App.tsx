@@ -58,7 +58,7 @@ export default function App() {
   const channelsState = useAsync(
     (signal) =>
       listChannels(
-        { server: selectedServerId ?? undefined, q: debouncedQuery || undefined },
+        { server: selectedServerId ?? undefined, q: debouncedQuery || undefined, limit: 2000 },
         signal,
       ),
     [selectedServerId, debouncedQuery],
