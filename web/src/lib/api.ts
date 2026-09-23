@@ -381,7 +381,13 @@ export async function fetchChannelDigests(
   return asList(payload, 'digests').map(parseDigest)
 }
 
-/** POST /api/capture */
+/*
+ * Legacy blocking calls. The UI no longer uses them: the API now enqueues and
+ * these endpoints are compat shims that answer straight away. Everything the
+ * app runs goes through createJob/queueCapture/queueDigest/queueDiscover below.
+ */
+
+/** @deprecated Use queueCapture: it does not tie the UI to one HTTP request. */
 export async function captureMessages(
   body: CaptureRequest,
   signal?: AbortSignal,
@@ -389,7 +395,7 @@ export async function captureMessages(
   return parseStatus(await requestRaw('/api/capture', { timeoutMs: LONG_TIMEOUT_MS, method: 'POST', body, signal }))
 }
 
-/** POST /api/digest */
+/** @deprecated Use queueDigest: it does not tie the UI to one HTTP request. */
 export async function generateDigest(
   body: DigestRequest,
   signal?: AbortSignal,
@@ -481,7 +487,7 @@ export function queueDiscover(signal?: AbortSignal): Promise<JobQueueResult> {
   return createJob({ kind: 'discover' }, signal)
 }
 
-/** POST /api/discover */
+/** @deprecated Use queueDiscover: it does not tie the UI to one HTTP request. */
 export async function discoverChannels(signal?: AbortSignal): Promise<ActionStatus> {
   return parseStatus(await requestRaw('/api/discover', { timeoutMs: LONG_TIMEOUT_MS, method: 'POST', body: {}, signal }))
 }
@@ -517,23 +523,82 @@ export interface JobStatus {
   finishedAt: string | null
 }
 
+/** Job ids are small integers, unlike Discord snowflakes. */
+function asJobId(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value)
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) return Number(value.trim())
+  return null
+}
+
+function asJobKind(value: unknown): JobKind {
+  const raw = asString(value).trim().toLowerCase()
+  return raw === 'capture' || raw === 'digest' || raw === 'discover' ? raw : 'other'
+}
+
+/**
+ * Unknown statuses are resolved through `finishedAt`: with one, the job is over
+ * (stop polling), without one it is still running (keep polling; the watcher
+ * gives up after an hour either way). A spelling change must never wedge a
+ * spinner or hide a finished run.
+ */
+function asJobState(value: unknown, finishedAt: string | null): JobState {
+  switch (asString(value).trim().toLowerCase()) {
+    case 'queued':
+    case 'pending':
+    case 'waiting':
+      return 'queued'
+    case 'running':
+    case 'active':
+    case 'working':
+    case 'starting':
+      return 'running'
+    case 'done':
+    case 'ok':
+    case 'success':
+    case 'complete':
+    case 'completed':
+    case 'finished':
+      return 'done'
+    case 'error':
+    case 'failed':
+    case 'failure':
+      return 'error'
+    default:
+      return finishedAt ? 'done' : 'running'
+  }
+}
+
+/** Accepts 0-100 or a 0-1 fraction and clamps to a sane percentage. */
+function asPercent(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null
+  const raw = asNumber(value, Number.NaN)
+  if (!Number.isFinite(raw)) return null
+  const scaled = raw > 0 && raw <= 1 && !Number.isInteger(raw) ? raw * 100 : raw
+  return Math.min(100, Math.max(0, Math.round(scaled * 10) / 10))
+}
+
 function parseJob(value: unknown): JobStatus {
   const row = asRecord(value)
-  const kind = asString(row.kind, 'other')
-  const status = asString(row.status, 'queued')
+  const finishedAt = asNullableString(row.finishedAt ?? row.finished_at)
   return {
-    id: asNumber(row.id),
-    kind: (['capture', 'digest', 'discover'].includes(kind) ? kind : 'other') as JobKind,
-    status: (['queued', 'running', 'done', 'error'].includes(status) ? status : 'queued') as JobState,
+    id: asJobId(row.id ?? row.jobId) ?? 0,
+    kind: asJobKind(row.kind),
+    status: asJobState(row.status ?? row.state, finishedAt),
     phase: asString(row.phase),
     message: asString(row.message),
     messages: asNumber(row.messages),
-    percent: typeof row.percent === 'number' ? row.percent : null,
-    channelId: asNullableString(row.channelId),
-    createdAt: asNullableString(row.createdAt),
-    updatedAt: asNullableString(row.updatedAt),
-    finishedAt: asNullableString(row.finishedAt),
+    percent: asPercent(row.percent ?? row.progress),
+    channelId: asNullableString(row.channelId ?? row.channel_id),
+    createdAt: asNullableString(row.createdAt ?? row.created_at),
+    updatedAt: asNullableString(row.updatedAt ?? row.updated_at),
+    finishedAt,
   }
+}
+
+function parseJobList(value: unknown): JobStatus[] {
+  return asList(value, 'jobs')
+    .map(parseJob)
+    .filter((job) => job.id > 0)
 }
 
 /** A job still worth polling. */
@@ -543,7 +608,16 @@ export function isJobActive(job: JobStatus): boolean {
 
 /** GET /api/jobs/<id> */
 export async function getJob(id: number, signal?: AbortSignal): Promise<JobStatus> {
-  return parseJob(await requestRaw(`/api/jobs/${id}`, { signal }))
+  const path = `/api/jobs/${id}`
+  const job = parseJob(await requestRaw(path, { signal }))
+  if (job.id <= 0) {
+    throw new ApiError(`${path} answered without a job id`, {
+      status: 0,
+      detail: 'the response shape changed, so progress cannot be tracked',
+      path,
+    })
+  }
+  return job
 }
 
 /** GET /api/jobs?limit= */
@@ -555,5 +629,5 @@ export async function listJobs(
     query: { limit: options.limit ?? 10 },
     signal,
   })
-  return asList(payload, 'jobs').map(parseJob)
+  return parseJobList(payload)
 }
