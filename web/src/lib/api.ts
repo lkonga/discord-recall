@@ -212,7 +212,13 @@ function parseStatus(value: unknown, ok = true): ActionStatus {
 /* Transport                                                           */
 /* ------------------------------------------------------------------ */
 
+const DEFAULT_TIMEOUT_MS = 30_000
+/** Capture/digest/discover run CLI subprocesses and legitimately take minutes. */
+const LONG_TIMEOUT_MS = 20 * 60_000
+
 interface RequestOptions {
+  /** Hard cap per request so a stalled fetch surfaces as an error, not a spinner. */
+  timeoutMs?: number
   method?: 'GET' | 'POST'
   query?: Record<string, string | number | undefined>
   body?: unknown
@@ -249,21 +255,41 @@ async function readDetail(response: Response): Promise<string | null> {
 
 async function requestRaw(path: string, options: RequestOptions = {}): Promise<unknown> {
   const url = buildUrl(path, options.query)
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const controller = new AbortController()
+  const timer = setTimeout(
+    () => controller.abort(new DOMException(`timed out after ${timeoutMs / 1000}s`, 'TimeoutError')),
+    timeoutMs,
+  )
+  if (options.signal) {
+    if (options.signal.aborted) controller.abort(options.signal.reason)
+    else options.signal.addEventListener('abort', () => controller.abort(), { once: true })
+  }
+
   let response: Response
   try {
     response = await fetch(url, {
       method: options.method ?? 'GET',
       headers: options.body === undefined ? undefined : { 'Content-Type': 'application/json' },
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      signal: options.signal,
+      signal: controller.signal,
     })
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      throw new ApiError(`${path} did not answer within ${timeoutMs / 1000}s`, {
+        status: 0,
+        detail: 'the server is busy (a digest run holds the store) or unreachable',
+        path,
+      })
+    }
     if (error instanceof DOMException && error.name === 'AbortError') throw error
     throw new ApiError(`Cannot reach the Discord Recall API at ${url}`, {
       status: 0,
       detail: error instanceof Error ? error.message : String(error),
       path,
     })
+  } finally {
+    clearTimeout(timer)
   }
 
   if (!response.ok) {
@@ -357,7 +383,7 @@ export async function captureMessages(
   body: CaptureRequest,
   signal?: AbortSignal,
 ): Promise<ActionStatus> {
-  return parseStatus(await requestRaw('/api/capture', { method: 'POST', body, signal }))
+  return parseStatus(await requestRaw('/api/capture', { timeoutMs: LONG_TIMEOUT_MS, method: 'POST', body, signal }))
 }
 
 /** POST /api/digest */
@@ -365,12 +391,12 @@ export async function generateDigest(
   body: DigestRequest,
   signal?: AbortSignal,
 ): Promise<ActionStatus> {
-  return parseStatus(await requestRaw('/api/digest', { method: 'POST', body, signal }))
+  return parseStatus(await requestRaw('/api/digest', { timeoutMs: LONG_TIMEOUT_MS, method: 'POST', body, signal }))
 }
 
 /** POST /api/discover */
 export async function discoverChannels(signal?: AbortSignal): Promise<ActionStatus> {
-  return parseStatus(await requestRaw('/api/discover', { method: 'POST', body: {}, signal }))
+  return parseStatus(await requestRaw('/api/discover', { timeoutMs: LONG_TIMEOUT_MS, method: 'POST', body: {}, signal }))
 }
 
 /** POST /api/ask */

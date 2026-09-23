@@ -95,7 +95,11 @@ async def healthz():
 async def index(msg: str = "", q: str = ""):
     """Serve the built React app when present, else the HTML fallback."""
     if (_DIST / "index.html").exists():
-        return FileResponse(_DIST / "index.html")
+        # Never let a browser cache the shell: hashed assets are immutable, the
+        # index must always point at the current build.
+        return FileResponse(
+            _DIST / "index.html", headers={"Cache-Control": "no-store, must-revalidate"}
+        )
     return await html_index(msg=msg, q=q)
 
 
