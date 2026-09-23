@@ -1,14 +1,23 @@
+# --- frontend (React + Vite + shadcn/ui) ---
+FROM node:22-alpine AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm install --no-audit --no-fund
+COPY web ./
+RUN npm run build
+
+# --- backend + UI host ---
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DATABASE_URL=sqlite+aiosqlite:////data/discord_recall.db \
     WEB_HOST=0.0.0.0 \
-    WEB_PORT=9879
+    WEB_PORT=9879 \
+    WEB_DIST=/app/web/dist
 
 WORKDIR /app
 
-# Discord needs no build deps for the self-bot client, but keep the image small.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl \
  && rm -rf /var/lib/apt/lists/*
@@ -20,6 +29,7 @@ RUN pip install --no-cache-dir ".[web]"
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY docker ./docker
+COPY --from=web /web/dist /app/web/dist
 RUN chmod +x /app/docker/entrypoint.sh
 
 VOLUME ["/data"]

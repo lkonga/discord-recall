@@ -19,3 +19,7 @@ __pycache__/
 
 # Deployment artifacts
 data/
+
+# Frontend build artifacts
+web/node_modules/
+web/dist/

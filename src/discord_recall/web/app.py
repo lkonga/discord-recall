@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import os
+import pathlib
 import asyncio
 from datetime import datetime, timezone
 
@@ -24,33 +25,13 @@ from sqlalchemy import desc, func, or_, select
 
 app = FastAPI(title="Discord Recall", docs_url=None, redoc_url=None)
 
+from discord_recall.web.api import router as api_router  # noqa: E402
 
-async def run_cli(args: list[str], timeout: float = 1800) -> tuple[int, str]:
-    """Run the CLI in a fresh process so capture/digest work never blocks the UI."""
-    proc = await asyncio.create_subprocess_exec(
-        "discord-recall",
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return 124, f"timed out after {int(timeout)}s"
-    text = out.decode(errors="replace")
-    return proc.returncode or 0, text
+app.include_router(api_router)
 
 
-def _last_line(text: str) -> str:
-    lines = [line for line in text.splitlines() if line.strip()]
-    if not lines:
-        return "(no output)"
-    line = lines[-1].strip()
-    # Strip the loguru prefix: "2026-09-23 22:34:00.314 | INFO | mod:fn:12 - message"
-    if " - " in line and "|" in line:
-        line = line.split(" - ", 1)[1].strip()
-    return line
+from discord_recall.web.runner import last_line as _last_line  # noqa: E402
+from discord_recall.web.runner import run_cli  # noqa: E402
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>{title}</title>
@@ -385,3 +366,18 @@ def main() -> None:  # pragma: no cover - entrypoint
 
 if __name__ == "__main__":  # pragma: no cover
     main()
+
+# --- SPA hosting -----------------------------------------------------------
+# The built React/shadcn app (web/dist) is mounted last so every /api route and
+# /healthz above keeps priority. Without a build, the server-rendered pages
+# below still work as a fallback.
+_DIST = pathlib.Path(
+    os.environ.get(
+        "WEB_DIST",
+        str(pathlib.Path(__file__).resolve().parents[3] / "web" / "dist"),
+    )
+)
+if _DIST.is_dir():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="spa")
