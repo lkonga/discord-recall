@@ -254,6 +254,24 @@ def digest_backfill(
 
 
 @app.command()
+def discover(
+    server_id: list[int] = typer.Option(
+        None, "--server", "-s", help="Guild ID to scan. Repeat for several. Default: all."
+    ),
+    delay: float = typer.Option(0.4, "--delay", help="Seconds between guild requests."),
+):
+    """List every server and text channel this account can see.
+
+    Unlike backfill, this makes no message requests: it only records the
+    channel catalogue so the UI can offer a full picker.
+    """
+    from discord_recall.capture.discover import discover as run_discover
+
+    servers, channels = asyncio.run(run_discover(server_id, delay=delay))
+    typer.echo(f"discovered {servers} servers, {channels} text channels")
+
+
+@app.command()
 def migrate():
     """Run database migrations (alembic upgrade head)."""
     subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], check=True)

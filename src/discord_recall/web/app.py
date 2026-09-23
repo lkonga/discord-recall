@@ -20,7 +20,7 @@ from urllib.parse import quote_plus
 
 from discord_recall.db import get_session_factory
 from discord_recall.db.models import Channel, Digest, Message, Server
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 
 app = FastAPI(title="Discord Recall", docs_url=None, redoc_url=None)
 
@@ -104,7 +104,8 @@ async def healthz():
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(msg: str = ""):
+async def index(msg: str = "", q: str = ""):
+    """Channel picker: every channel the account knows about, filterable."""
     factory = get_session_factory()
     async with factory() as session:
         msg_count = (
@@ -119,70 +120,79 @@ async def index(msg: str = ""):
             .correlate(Channel)
             .scalar_subquery()
         )
+        stmt = (
+            select(
+                Channel.id,
+                Channel.name,
+                Server.name,
+                func.count(Digest.id),
+                func.max(Digest.period_start),
+                msg_count,
+                last_msg,
+            )
+            .join(Server, Channel.server_id == Server.id)
+            .outerjoin(Digest, Digest.channel_id == Channel.id)
+            .group_by(Channel.id, Channel.name, Server.name)
+        )
+        if q:
+            needle = f"%{q.lower()}%"
+            stmt = stmt.where(
+                or_(
+                    func.lower(Channel.name).like(needle),
+                    func.lower(Server.name).like(needle),
+                )
+            )
         rows = (
             await session.execute(
-                select(
-                    Channel.id,
-                    Channel.name,
-                    Server.name,
-                    func.count(Digest.id),
-                    func.max(Digest.period_start),
-                    msg_count,
-                    last_msg,
-                )
-                .join(Server, Channel.server_id == Server.id)
-                .outerjoin(Digest, Digest.channel_id == Channel.id)
-                .group_by(Channel.id, Channel.name, Server.name)
-                .order_by(desc(func.count(Digest.id)), desc(msg_count))
+                stmt.order_by(desc(msg_count), Server.name, Channel.name).limit(500)
             )
         ).all()
-        digest_total = (
-            await session.execute(select(func.count(Digest.id)))
+        channel_total = (
+            await session.execute(select(func.count(Channel.id)))
         ).scalar_one()
+        digest_total = (await session.execute(select(func.count(Digest.id)))).scalar_one()
         msg_total = (await session.execute(select(func.count(Message.id)))).scalar_one()
 
-    tracked = {
-        c.strip() for c in os.environ.get("DIGEST_CHANNELS", "").split(",") if c.strip()
-    }
     body = [
-        f"<p class='muted'>{digest_total} digests · {msg_total} captured messages · "
-        f"scheduler captures: {', '.join(sorted(tracked)) or 'nothing yet'}</p>"
+        f"<p class='muted'>{channel_total} channels known · {msg_total} captured messages · "
+        f"{digest_total} digests</p>"
     ]
     body.append(
-        "<table><tr><th>Server</th><th>Channel</th><th>Tracked</th><th>Messages</th>"
-        "<th>Digests</th><th>Latest digest</th><th>Last message</th><th></th></tr>"
-    )
-    for cid, name, server, digests, latest, msgs, last_msg in rows:
-        link = f"<a href='/channel/{cid}'>#{html.escape(name)}</a>"
-        when = latest.strftime("%Y-%m-%d") if latest else "-"
-        last_seen = last_msg.strftime("%Y-%m-%d") if last_msg else "-"
-        is_tracked = "yes" if str(cid) in tracked else ""
-        default_day = when if when != "-" else last_seen
-        gen = (
-            f"<form method='post' action='/generate/{cid}'>"
-            f"<input type='date' name='day' value='{default_day}'>"
-            f"<button>digest that day</button></form>"
-        )
-        body.append(
-            f"<tr><td>{html.escape(server)}</td><td>{link}</td><td>{is_tracked}</td>"
-            f"<td>{msgs}</td><td>{digests}</td><td>{when}</td><td>{last_seen}</td>"
-            f"<td>{gen}</td></tr>"
-        )
-    body.append("</table>")
-    body.append(
-        "<h3>Capture a channel</h3>"
-        "<form method='post' action='/capture-new'>"
-        "<input name='channel_id' placeholder='channel ID' size='22' required>"
-        "<label>since <input type='date' name='since'></label>"
-        "<label>max messages <input type='number' name='max_messages' value='600' "
-        "min='50' step='50'></label><button>capture</button></form>"
+        "<h3>1. Pick a channel</h3>"
+        "<form method='get' action='/'>"
+        f"<input name='q' size='28' placeholder='filter by channel or server name' value='{html.escape(q)}'>"
+        "<button>filter</button></form>"
+        "<form method='post' action='/discover'>"
+        "<button>refresh channel list from Discord</button>"
+        "<span class='muted'> (lists every text channel the account can see; ~1 request per server)</span>"
+        "</form>"
     )
     if msg:
         body.append(f"<p class='muted'>{html.escape(msg)}</p>")
+
+    shown = len(rows)
     body.append(
-        "<p class='muted'>Every channel in the local store is listed, with or without "
-        "digests. To capture a new channel, add its ID to DIGEST_CHANNELS in the "
-        "Dokploy environment and the next cycle will start pulling it.</p>"
+        f"<p class='muted'>showing {shown} channel(s)"
+        + (f" matching {html.escape(q)!r}" if q else "")
+        + (", capped at 500 - use the filter" if shown == 500 else "")
+        + "</p>"
+    )
+    body.append(
+        "<table><tr><th>Server</th><th>Channel</th><th>Messages</th><th>Last message</th>"
+        "<th>Digests</th><th>Latest digest</th></tr>"
+    )
+    for cid, name, server, digests, latest, msgs, last_seen in rows:
+        link = f"<a href='/channel/{cid}'>#{html.escape(name)}</a>"
+        when = latest.strftime("%Y-%m-%d") if latest else "-"
+        seen = last_seen.strftime("%Y-%m-%d") if last_seen else "-"
+        body.append(
+            f"<tr><td>{html.escape(server)}</td><td>{link}</td><td>{msgs}</td>"
+            f"<td>{seen}</td><td>{digests}</td><td>{when}</td></tr>"
+        )
+    body.append("</table>")
+    body.append(
+        "<p class='muted'>Open a channel to run the flow: <b>1.</b> capture messages "
+        "for a date range, <b>2.</b> build the digest for the days you want.</p>"
     )
     body.append(
         "<h3>Ask</h3><form method='post' action='/ask'>"
@@ -190,11 +200,24 @@ async def index(msg: str = ""):
         "<select name='channel_id'><option value=''>all channels</option>"
         + "".join(
             f"<option value='{cid}'>#{html.escape(name)}</option>"
-            for cid, name, _, _, _, _, _ in rows
+            for cid, name, _, _, _, msgs, _ in rows
+            if msgs
         )
         + "</select><button>ask</button></form>"
     )
-    return render("Discord Recall", "".join(body), "local digests")
+    return render("Discord Recall", "".join(body), "channel picker")
+
+
+@app.post("/discover")
+async def discover_ui(server_id: str = Form("")):
+    """Refresh the channel catalogue from Discord."""
+    args = ["discover"]
+    for sid in [s.strip() for s in server_id.split(",") if s.strip()]:
+        args += ["--server", sid]
+    rc, out = await run_cli(args)
+    return RedirectResponse(
+        f"/?msg={quote_plus(f'discover rc={rc}: {_last_line(out)}')}", status_code=303
+    )
 
 
 @app.get("/channel/{channel_id}", response_class=HTMLResponse)
@@ -349,7 +372,6 @@ async def ask(question: str = Form(...), channel_id: str = Form("")):
 
 
 def main() -> None:  # pragma: no cover - entrypoint
-    import os
 
     import uvicorn
 
