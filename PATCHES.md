@@ -167,3 +167,75 @@ Semantics:
 
 Not verified: `listen` (real-time capture) was not exercised, only `backfill`.
 The token used is a self-bot user token, so Discord ToS risk applies.
+
+## 6. Consuming digests (web UI) and deployment on g5kc
+
+Upstream ships no UI (`GUI.md` is a design spec for one, and `src/` has no web
+dependency). Added a read-only FastAPI UI plus a containerised deployment.
+
+### UI
+
+```bash
+uv sync --extra web
+uv run discord-recall-web            # http://127.0.0.1:9879
+```
+
+Routes: `/` (channels + digest counts + ask box), `/channel/<id>` (every digest
+for that channel, newest first), `POST /generate/<id>` (build one day's digest
+from a date input), `POST /ask` (grounded Q&A over stored digests/messages),
+`/healthz`. No authentication: it is meant to sit behind loopback +
+`tailscale serve`.
+
+### Deployment (g5kc, Dokploy)
+
+| Item | Value |
+|---|---|
+| Source | `github.com/lkonga/discord-recall`, branch `main` |
+| Dokploy project / app | `discord-recall` / `discord-recall-dffwka` |
+| composeId | `hwSpDcOHts8-cq3Ph-RXU` |
+| Compose path | `docker-compose.dokploy.yml` |
+| Container | `discord-recall-dffwka-recall-1` (healthy) |
+| Store | docker volume `discord-recall-dffwka_recall-data` -> `/data` |
+| UI | `https://g5kc.tail1e9037.ts.net:9879/` (tailnet only) |
+
+Design notes:
+
+* **Host networking.** OmniRoute listens on `127.0.0.1:20129` only, so a bridge
+  container cannot reach it. `network_mode: host` fixes that and keeps
+  MagicDNS working. `WEB_HOST=127.0.0.1` then pins the UI to loopback so host
+  networking does not publish it.
+* **Exposure.** `tailscale serve --bg --https=9879 http://127.0.0.1:9879`.
+  No Dokploy Traefik domain is attached, so there is no public URL.
+* **Secrets** live in Dokploy's compose env (`DISCORD_TOKEN`, `LLM_BASE_URL`,
+  `LLM_MODEL`, `LLM_API_KEY`) and are injected at runtime; the public repo
+  contains none.
+* **Scheduler** (`docker/scheduler.py`) runs every `SCHEDULE_INTERVAL_SECONDS`
+  (default 6h): per configured channel a bounded backfill
+  (`BACKFILL_DAYS`, `MAX_MESSAGES`) then `digest-range` over the last
+  `DIGEST_DAYS`, with `--send` when `SEND_TELEGRAM=true`. Each step is a fresh
+  CLI process, so a failure cannot wedge the loop.
+
+Redeploy after a change:
+
+```bash
+git push deploy deepseek-digest-range:main
+curl -sk -X POST https://g5kc.tail1e9037.ts.net:13900/api/compose.deploy \
+  -H "x-api-key: $DOKPLOY_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"composeId":"hwSpDcOHts8-cq3Ph-RXU"}'
+```
+
+Back up / restore the store:
+
+```bash
+docker run --rm -v discord-recall-dffwka_recall-data:/data -v "$PWD":/out alpine \
+  tar czf /out/recall-store.tgz -C /data .
+docker run --rm -v discord-recall-dffwka_recall-data:/data -v "$PWD":/out alpine \
+  tar xzf /out/recall-store.tgz -C /data
+```
+
+Timeshift snapshots on g5kc need an interactive sudo password:
+
+```bash
+sudo timeshift --create --comments "discord-recall pre-deploy"
+sudo timeshift --create --comments "discord-recall post-deploy"
+```
