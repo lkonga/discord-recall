@@ -239,3 +239,40 @@ Timeshift snapshots on g5kc need an interactive sudo password:
 sudo timeshift --create --comments "discord-recall pre-deploy"
 sudo timeshift --create --comments "discord-recall post-deploy"
 ```
+
+## 7. Pacing policy for the self-bot token (researched)
+
+Capture runs through the background queue (`src/discord_recall/web/jobs.py`), one
+Discord-touching job at a time, with the policy below. Evidence is from a
+dedicated rate-limit study of `dolfies/discord.py-self` (`discord/http.py`,
+`discord/abc.py`), `Tyrrrz/DiscordChatExporter` (`DiscordClient.cs`,
+`Utils/Http.cs`), the Undiscord issue threads, and Discord's public rate-limit
+docs (`discord-api-docs`) plus the user-token notes in `discord-userdoccers`.
+
+| Parameter | Value we ship | Why / evidence |
+|---|---|---|
+| Page size | `limit=100` (`--batch-size 100`) | DCE paginates at 100; py-self `history(limit=100)`. `limit=1` is a scripted-footprint tell |
+| Base delay | 2.5 s | Undiscord hand-tested floor ~2100 ms; DCE's 1 s is a floor, not a pace |
+| Jitter | +0 to +1.5 s uniform, never below base | Undiscord #168/#245: *constant* intervals are the signal, but dipping below the floor is worse |
+| Cap per run | 1000 messages (≈10 requests) | Keeps a single run well inside the 30-request budget |
+| Max requests | ≤30/run, ≤60/h, ≥10 min between automated runs | Requests, not messages, are the scarce unit |
+| On 429 | wait `retry_after + 1 s` buffer, doubling per consecutive strike | DCE DelayGenerator adds a 1 s buffer to reset time |
+| Consecutive 429s | **hard stop after 3** (`PACE_MAX_429_STRIKES`) | py-self stops sleeping and raises instead of retrying forever |
+| 429 without `Retry-After` | abort the run, do not retry | userdoccers: "If no `Retry-After` header is present, you should not programmatically retry" |
+| Global / Cloudflare 429 | abort run, pause 15 min | py-self gates every request on a global lock after a global limit |
+| After any 429 | 10 min pause before the next job | Behavioural footprint grows with back-to-back runs |
+| 401 | stop immediately, no retry | token is invalid; py-self raises rather than retrying |
+| 403 | fail that channel's run, no retry | channel is not readable by this account |
+| 5xx | ≤2 retries (handled inside py-self), then abort | py-self sleeps `1 + 2n` on 502/504/507/522-524 |
+| Parallel channels | never more than 1 | per-route buckets are independent, but the global ceiling, the 10k/10min invalid-request budget and the undocumented Cloudflare layer are shared |
+
+Invalid-request budget (10k/10min → 24 h ban) counts 401/403/429, but at ~10
+requests per run it is not the binding constraint. The binding constraints are
+per-route 429s and behavioural detection, which is why the hard stops matter more
+than delay tuning. `PACE_*` env vars override every value above.
+
+Known trade-off: windowed captures are stateless by design (they never touch
+`channel_backfill_state`), so a repeated cron re-reads the head of the window
+instead of resuming a cursor. With a 2-day window and a 1000-message cap that is
+a handful of requests, and it keeps the "bounded run cannot corrupt resume
+state" guarantee.

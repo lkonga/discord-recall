@@ -27,11 +27,17 @@ from sqlalchemy import select, update
 from discord_recall.db import get_session_factory
 from discord_recall.db.models import Job, JobStatus
 
-PACE_BATCH = int(os.environ.get("PACE_BATCH", "50"))
+PACE_BATCH = int(os.environ.get("PACE_BATCH", "100"))
 PACE_DELAY = float(os.environ.get("PACE_DELAY", "2.5"))
-PACE_JITTER = float(os.environ.get("PACE_JITTER", "0.3"))
+# Jitter only ever ADDS to the base delay: a fixed pace is the pattern that gets
+# flagged, but going below the researched floor is worse.
+PACE_JITTER_EXTRA = float(os.environ.get("PACE_JITTER_EXTRA", "1.5"))
 PACE_MAX_MESSAGES = int(os.environ.get("PACE_MAX_MESSAGES", "1000"))
-COOLDOWN_429 = float(os.environ.get("PACE_429_COOLDOWN", "90"))
+PACE_MAX_REQUESTS = int(os.environ.get("PACE_MAX_REQUESTS", "30"))
+COOLDOWN_429 = float(os.environ.get("PACE_429_COOLDOWN", "60"))
+GLOBAL_COOLDOWN = float(os.environ.get("PACE_GLOBAL_COOLDOWN", "900"))
+MAX_429_STRIKES = int(os.environ.get("PACE_MAX_429_STRIKES", "3"))
+POST_429_PAUSE = float(os.environ.get("PACE_POST_429_PAUSE", "600"))
 POLL_SECONDS = float(os.environ.get("JOB_POLL_SECONDS", "2"))
 
 _MESSAGES_RE = re.compile(r"(\d+) messages so far")
@@ -47,7 +53,8 @@ def _now() -> datetime:
 
 
 def _jittered(delay: float) -> float:
-    return max(0.5, delay * (1 + random.uniform(-PACE_JITTER, PACE_JITTER)))
+    """Base delay plus uniform extra, never below the base."""
+    return delay + random.uniform(0, PACE_JITTER_EXTRA)
 
 
 async def _update(job_id: int, **fields) -> None:
@@ -170,8 +177,17 @@ def build_args(job: Job) -> list[str]:
     raise ValueError(f"unknown job kind {job.kind!r}")
 
 
+class RateLimitAbort(RuntimeError):
+    """Raised when the run must stop: too many 429s, or a global/CF block."""
+
+
 async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
-    """Run the CLI, streaming progress into the job row and honouring 429s."""
+    """Run the CLI, streaming progress into the job row and honouring 429s.
+
+    Policy (from the rate-limit research in PATCHES.md): exponential spaced
+    waits starting at retry_after + 1s buffer, hard stop after three consecutive
+    429s, and an immediate abort plus a long pause on a global/Cloudflare block.
+    """
     proc = await asyncio.create_subprocess_exec(
         "discord-recall",
         *args,
@@ -180,6 +196,7 @@ async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
     )
     lines: list[str] = []
     cooldowns = 0
+    rate_limited = False
     assert proc.stdout is not None
     async for raw in proc.stdout:
         line = raw.decode(errors="replace").rstrip()
@@ -196,7 +213,30 @@ async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
             )
         elif _LIMIT_RE.search(line):
             cooldowns += 1
-            wait = min(COOLDOWN_429 * cooldowns, 900)
+            rate_limited = True
+            global_block = bool(re.search(r"global|cloudflare|ban", line, re.I))
+            retry_after = re.search(r"retry.?after[^0-9]{0,4}(\d+(?:\.\d+)?)", line, re.I)
+
+            if cooldowns > MAX_429_STRIKES or global_block:
+                proc.kill()
+                reason = (
+                    "global/Cloudflare rate-limit block" if global_block
+                    else f"{cooldowns - 1} consecutive rate limits"
+                )
+                await _update(
+                    job.id,
+                    phase="aborted",
+                    message=f"stopped: {reason}; pausing {int(GLOBAL_COOLDOWN / 60)}min",
+                )
+                logger.error(f"job {job.id}: aborting run ({reason})")
+                await asyncio.sleep(GLOBAL_COOLDOWN)
+                raise RateLimitAbort(reason)
+
+            # exponential spaced waits, never shorter than retry_after + 1s buffer
+            wait = COOLDOWN_429 * (2 ** (cooldowns - 1))
+            if retry_after:
+                wait = max(wait, min(float(retry_after.group(1)), 900) + 1.0)
+            wait = min(wait, 900)
             await _update(
                 job.id,
                 phase="cooling down",
@@ -204,23 +244,33 @@ async def _run_process(job: Job, args: list[str]) -> tuple[int, str]:
             )
             logger.warning(f"job {job.id}: {line[-160:]} - sleeping {int(wait)}s")
             await asyncio.sleep(wait)
-            retry_after = re.search(r"retry.?after[^0-9]{0,4}(\d+(?:\.\d+)?)", line, re.I)
-            if retry_after:
-                await asyncio.sleep(min(float(retry_after.group(1)), 900))
         else:
             tail = line.split(" - ", 1)[-1] if "|" in line else line
             await _update(job.id, message=tail[-200:])
 
     rc = await proc.wait()
+    if rate_limited:
+        lines.append("__RATE_LIMITED__")
     return rc or 0, "\n".join(lines)
 
 
-async def _execute(job: Job) -> None:
+async def _execute(job: Job) -> bool:
+    """Run one job. Returns True when the run saw a rate limit."""
     args = build_args(job)
     logger.info(f"job {job.id} ({job.kind}) starting: {' '.join(args)}")
     await _update(job.id, phase="running", message=f"discord-recall {' '.join(args)}")
     try:
         rc, output = await _run_process(job, args)
+    except RateLimitAbort as exc:
+        await _update(
+            job.id,
+            status=JobStatus.error.value,
+            phase="rate limited",
+            message=f"stopped to protect the token: {exc}",
+            finished_at=_now(),
+        )
+        logger.error(f"job {job.id} aborted: {exc}")
+        return True
     except Exception as exc:  # noqa: BLE001 - surfaced to the job row
         await _update(
             job.id,
@@ -230,7 +280,7 @@ async def _execute(job: Job) -> None:
             finished_at=_now(),
         )
         logger.exception(f"job {job.id} crashed")
-        return
+        return False
 
     final = [line for line in output.splitlines() if line.strip()][-1:] or [""]
     summary = final[0].split(" - ", 1)[-1] if "|" in final[0] else final[0]
@@ -246,13 +296,15 @@ async def _execute(job: Job) -> None:
         finished_at=_now(),
     )
     logger.info(f"job {job.id} finished rc={rc}: {summary[-160:]}")
+    return "__RATE_LIMITED__" in output
 
 
 async def worker_loop() -> None:
     """Single worker: one Discord-touching job at a time, forever."""
     logger.info(
-        f"job worker started (batch={PACE_BATCH} delay={PACE_DELAY}s "
-        f"jitter=±{int(PACE_JITTER * 100)}% cap={PACE_MAX_MESSAGES})"
+        f"job worker started (batch={PACE_BATCH} delay={PACE_DELAY}s"
+        f"+0-{PACE_JITTER_EXTRA}s jitter cap={PACE_MAX_MESSAGES} "
+        f"max-429-strikes={MAX_429_STRIKES})"
     )
     while not _stop:
         try:
@@ -260,9 +312,10 @@ async def worker_loop() -> None:
             if job is None:
                 await asyncio.sleep(POLL_SECONDS)
                 continue
-            await _execute(job)
-            # small breather between jobs keeps bursts from ever forming
-            await asyncio.sleep(_jittered(3))
+            limited = await _execute(job)
+            # A run that hit a 429 buys a long pause before the next one, so the
+            # token is never run in a tight loop even across different channels.
+            await asyncio.sleep(POST_429_PAUSE if limited else _jittered(3))
         except asyncio.CancelledError:  # pragma: no cover - shutdown
             raise
         except Exception:  # noqa: BLE001 - the loop must survive
