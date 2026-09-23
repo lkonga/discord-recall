@@ -41,6 +41,7 @@ POST_429_PAUSE = float(os.environ.get("PACE_POST_429_PAUSE", "600"))
 POLL_SECONDS = float(os.environ.get("JOB_POLL_SECONDS", "2"))
 
 _MESSAGES_RE = re.compile(r"(\d+) messages so far")
+_COMPLETE_RE = re.compile(r"Backfill complete[^\d]{0,6}(\d+) messages")
 _DISCOVER_RE = re.compile(r"discovered (\d+) servers, (\d+) text channels")
 _DIGEST_RE = re.compile(r"(\d+) built, (\d+) reused")
 _LIMIT_RE = re.compile(r"rate limited|429", re.IGNORECASE)
@@ -284,8 +285,19 @@ async def _execute(job: Job) -> bool:
 
     final = [line for line in output.splitlines() if line.strip()][-1:] or [""]
     summary = final[0].split(" - ", 1)[-1] if "|" in final[0] else final[0]
-    messages = _MESSAGES_RE.search(output)
-    total = int(messages.group(1)) if messages else int(_DISCOVER_RE.search(output).group(2)) if _DISCOVER_RE.search(output) else 0
+    # Prefer the completion line ("Backfill complete — N messages") over the last
+    # progress line, which can lag one batch behind.
+    complete = _COMPLETE_RE.search(output)
+    progress = _MESSAGES_RE.search(output)
+    discover = _DISCOVER_RE.search(output)
+    if complete:
+        total = int(complete.group(1))
+    elif progress:
+        total = int(progress.group(1))
+    elif discover:
+        total = int(discover.group(2))
+    else:
+        total = 0
 
     await _update(
         job.id,
