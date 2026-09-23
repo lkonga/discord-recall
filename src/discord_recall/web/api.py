@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import desc, func, select
 
 from discord_recall.db import get_session_factory
 from discord_recall.db.models import Channel, Digest, Message, Server

@@ -12,7 +12,6 @@ from __future__ import annotations
 import html
 import os
 import pathlib
-import asyncio
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Form
@@ -377,7 +376,7 @@ _DIST = pathlib.Path(
         str(pathlib.Path(__file__).resolve().parents[3] / "web" / "dist"),
     )
 )
-if _DIST.is_dir():
+if (_DIST / "index.html").exists():
     from fastapi.staticfiles import StaticFiles
 
     app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="spa")

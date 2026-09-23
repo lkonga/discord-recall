@@ -1,10 +1,14 @@
 # --- frontend (React + Vite + shadcn/ui) ---
 FROM node:22-alpine AS web
 WORKDIR /web
-COPY web/package.json web/package-lock.json* ./
-RUN npm install --no-audit --no-fund
-COPY web ./
-RUN npm run build
+# The frontend is optional at build time: if web/package.json is absent the
+# stage emits an empty dist and the image serves the server-rendered fallback.
+COPY web ./web
+RUN cd web && if [ -f package.json ]; then \
+      npm install --no-audit --no-fund && npm run build; \
+    else \
+      mkdir -p dist && echo "no frontend sources present"; \
+    fi
 
 # --- backend + UI host ---
 FROM python:3.12-slim
